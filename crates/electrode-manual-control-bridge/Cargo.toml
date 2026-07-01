@@ -1,0 +1,22 @@
+[package]
+name = "electrode-manual-control-bridge"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Electrode native bridge from USB RC transmitter joystick input to Synapse ManualControl FlatBuffers over Zenoh"
+
+[[bin]]
+name = "electrode-manual-control-bridge"
+path = "src/main.rs"
+
+[[bin]]
+name = "electrode-manual-control-dump"
+path = "src/bin/dump.rs"
+
+[dependencies]
+clap.workspace = true
+flatbuffers.workspace = true
+synapse_fbs.workspace = true
+thiserror.workspace = true
+zenoh.workspace = true
