@@ -1,16 +1,16 @@
 use clap::Parser;
-use synapse_fbs::topic::{ManualControlData, ManualControlFlags};
+use synapse_fbs::topic::RadioControlData;
 use thiserror::Error;
+use zenoh::{Wait, config::Config};
 
-/// Wire size of a bare `synapse.topic.ManualControlData` struct.
-const MANUAL_CONTROL_PAYLOAD_SIZE: usize = 40;
-use zenoh::{config::Config, Wait};
+/// Wire size of a bare `synapse.topic.RadioControlData` struct.
+const RADIO_CONTROL_PAYLOAD_SIZE: usize = 48;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "electrode-manual-control-dump",
+    name = "electrode-radio-control-dump",
     version,
-    about = "Subscribe to Synapse ManualControl over Zenoh and print decoded fields"
+    about = "Subscribe to Synapse RadioControl over Zenoh and print decoded PPM wire channels"
 )]
 struct Cli {
     #[arg(
@@ -27,8 +27,8 @@ struct Cli {
         alias = "zenoh-topic",
         env = "ZENOH_TOPIC",
         value_name = "KEYEXPR",
-        default_value = "synapse/v1/topic/manual_control_command",
-        help = "Zenoh key expression for synapse.topic.ManualControlData bare structs"
+        default_value = "synapse/v1/topic/radio_control",
+        help = "Zenoh key expression for synapse.topic.RadioControlData bare structs"
     )]
     topic: String,
 }
@@ -37,7 +37,7 @@ struct Cli {
 enum DumpError {
     #[error("zenoh error: {0}")]
     Zenoh(String),
-    #[error("manual control payload is {actual} bytes, expected {expected}")]
+    #[error("radio control payload is {actual} bytes, expected {expected}")]
     PayloadSize { expected: usize, actual: usize },
 }
 
@@ -58,30 +58,22 @@ fn main() -> Result<()> {
             .recv()
             .map_err(|error| DumpError::Zenoh(error.to_string()))?;
         let payload = sample.payload().to_bytes();
-        // 0.3.0 transmits ManualControlData as a bare fixed-layout struct.
-        if payload.len() != MANUAL_CONTROL_PAYLOAD_SIZE {
+        if payload.len() != RADIO_CONTROL_PAYLOAD_SIZE {
             return Err(DumpError::PayloadSize {
-                expected: MANUAL_CONTROL_PAYLOAD_SIZE,
+                expected: RADIO_CONTROL_PAYLOAD_SIZE,
                 actual: payload.len(),
             });
         }
-        // Safety: fixed-layout structs are repr(transparent) byte arrays with
-        // unaligned accessors, and the size check above covers the struct.
-        let data = unsafe { <ManualControlData as flatbuffers::Follow>::follow(&payload, 0) };
-        let flags = ManualControlFlags::from_bits_retain(data.flags());
-        let milli = |value: i16| f32::from(value) / 1000.0;
-
+        let data = unsafe { <RadioControlData as flatbuffers::Follow>::follow(&payload, 0) };
         println!(
-            "roll={:+.3} pitch={:+.3} yaw={:+.3} throttle={:.3} mode={} arm={} kill={} active={} valid={} timestamp_us={}",
-            milli(data.roll_milli()),
-            milli(data.pitch_milli()),
-            milli(data.yaw_milli()),
-            milli(data.throttle_milli()),
-            data.flight_mode(),
-            flags.contains(ManualControlFlags::ArmSwitch),
-            flags.contains(ManualControlFlags::KillSwitch),
-            flags.contains(ManualControlFlags::Active),
-            flags.contains(ManualControlFlags::Valid),
+            "ch1={} ch2={} ch3={} ch4={} ch5={} count={} link={} timestamp_us={}",
+            data.chan0_raw_us(),
+            data.chan1_raw_us(),
+            data.chan2_raw_us(),
+            data.chan3_raw_us(),
+            data.chan4_raw_us(),
+            data.channel_count(),
+            data.link_quality_pct(),
             data.timestamp_us(),
         );
     }
