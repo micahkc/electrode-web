@@ -2,9 +2,10 @@
 // It consumes private Ground-Station-provided PWM and publishes private plant
 // pose. Ground Station owns the public Synapse/Zenoh hardware-facing topics.
 //
-// Two WASM modules live in this worker: the rumoca stepper (loaded at runtime
-// from /wasm/) and zenoh-wasm (bundled). All sim state stays here; the main
-// thread only starts/stops and receives status.
+// Two WASM modules live in this worker: the rumoca stepper (loaded from the
+// static wasm asset URL provided by the main thread) and zenoh-wasm (bundled).
+// All sim state stays here; the main thread only starts/stops and receives
+// status.
 
 import { decode, encodeMocapFrame } from '@electrode/sdk';
 
@@ -14,6 +15,8 @@ type StartMessage = {
   endpoint: string;
   /** Bundler-resolved URL for zenoh_wasm_bg.wasm. */
   zenohWasmUrl: string;
+  /** Base-path-aware URL for the rumoca wasm-bindgen glue script. */
+  rumocaGlueUrl: string;
   /** Modelica source (self-contained) and top-level model name. */
   modelSource: string;
   modelName: string;
@@ -50,11 +53,9 @@ function post(message: any): void {
   self.postMessage(message);
 }
 
-async function loadRumoca(): Promise<void> {
+async function loadRumoca(rumocaGlueUrl: string): Promise<void> {
   if (rumoca) return;
-  // Dynamic import via Function() so Vite/Rollup don't statically resolve it —
-  // the stepper wasm is served from /wasm/ at runtime, not bundled.
-  rumoca = await (new Function('return import("/wasm/rumoca_bind_wasm.js")'))();
+  rumoca = await import(/* @vite-ignore */ rumocaGlueUrl);
   await rumoca.default();
   rumoca.init();
 }
@@ -112,7 +113,7 @@ async function start(msg: StartMessage): Promise<void> {
 
   // 1. Compile the flight model (blocks a few seconds — one-time).
   post({ type: 'status', phase: 'compiling' });
-  await loadRumoca();
+  await loadRumoca(msg.rumocaGlueUrl);
   stepper = new rumoca.WasmStepper(msg.modelSource, msg.modelName, msg.solver ?? 'rk-like');
   post({ type: 'status', phase: 'compiled' });
 

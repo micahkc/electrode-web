@@ -17,7 +17,7 @@
     "lint:js": "eslint .",
     "lint:rust-files": "node scripts/check-rust-file-lines.mjs",
     "test": "vitest run",
-    "verify:pages": "node -e \"const fs=require('node:fs'); const files=fs.readdirSync('apps/web/build',{recursive:true}).map(String); if (!files.includes('index.html')) throw new Error('apps/web/build/index.html missing'); if (!files.some((file)=>/zenoh_wasm_bg.*\\.wasm$/.test(file))) throw new Error('zenoh wasm asset missing from static build');\"",
+    "verify:pages": "node scripts/verify-pages-build.mjs",
     "ci": "npm run lint && npm run test && npm run check && npm run build && npm run verify:pages",
     "station": "npm run build && ELECTRODE_GCS_ZENOH_CONNECT=udp/192.168.10.2:7447 cargo run -p electrode-ground-station --",
     "ground-station": "ELECTRODE_GCS_ZENOH_CONNECT=udp/192.168.10.2:7447 cargo run -p electrode-ground-station --",

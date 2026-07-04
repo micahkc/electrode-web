@@ -40,7 +40,11 @@ jobs:
       - run: nix develop --command npm run test
       - run: nix develop --command npm run check
       - run: nix develop --command npm run build
+        env:
+          ELECTRODE_WEB_BASE_PATH: /electrode-web
       - run: nix develop --command npm run verify:pages
+        env:
+          ELECTRODE_WEB_BASE_PATH: /electrode-web
 
       - name: Configure Pages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
