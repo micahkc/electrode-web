@@ -4,6 +4,7 @@
 // dropped into any Three.js scene (the flying local-nav map and the fixed-angle
 // deflection panel). Node names and hinge axes match the rigged rumoca sim
 // models (airplane.glb / drone.glb).
+import { asset } from '$app/paths';
 import * as three from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import type { ControlInputs } from '@electrode/sdk';
@@ -96,7 +97,7 @@ function clamp(value: number, min: number, max: number): number {
  */
 export async function loadVehicleRig(kind: VehicleKind, targetSize?: number): Promise<VehicleRig> {
   const config = VEHICLES[kind];
-  const gltf = await new GLTFLoader().loadAsync(config.url);
+  const gltf = await new GLTFLoader().loadAsync(asset(config.url));
   const model = gltf.scene;
 
   configureModelMeshes(model);

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { asset } from '$app/paths';
   import { onMount } from 'svelte';
   import IndoorScene from '$lib/components/IndoorScene.svelte';
   import DeflectionView from '$lib/components/DeflectionView.svelte';
@@ -657,7 +658,7 @@
     <div class="brand">
       <div class="brand-mark">
         <img
-          src={theme === 'light' ? '/electrode-light.png' : '/electrode-dark.png'}
+          src={asset(theme === 'light' ? '/electrode-light.png' : '/electrode-dark.png')}
           alt="electrode — ground station for CogniPilot"
         />
       </div>
