@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "rust";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-acae27ef.js";
+            window.path_to_searchindex_js = "searchindex-d856caf9.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-c3e5e778.js"></script>
@@ -179,15 +179,30 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="using-the-ui"><a class="header" href="#using-the-ui">Using The UI</a></h1>
-<p>This page is a tour of the Electrode screen in static Viewer mode. Viewer mode
-is what the GitHub Pages build shows when no local Ground Station daemon is
-present. When the app is served by <code>electrode-ground-station</code>, extra Dashboard
-configuration, Firmware, and SIM controls appear.</p>
-<p><img src="assets/ui/dashboard-tall.png" alt="Electrode dashboard overview"></p>
+<p>This page is a tour of Electrode in full Ground Station mode. Ground Station
+mode is active when the app is served by <code>electrode-ground-station</code> and the
+same-origin <code>gcs/*</code> APIs are available. That unlocks hardware status, RC
+mapping, PPM output, autopilot control, and simulation workbench panels.</p>
+<p><img src="assets/ui/groundstation-dashboard.png" alt="Electrode Ground Station dashboard"></p>
+<h2 id="from-a-fresh-clone"><a class="header" href="#from-a-fresh-clone">From A Fresh Clone</a></h2>
+<p>From the repository root:</p>
+<pre><code class="language-sh">npm ci
+npm run station
+</code></pre>
+<p><code>npm run station</code> builds the web app, starts the Rust Ground Station daemon,
+serves the UI, and enables the local <code>gcs/*</code> hardware APIs. When it is ready,
+open:</p>
+<pre><code class="language-text">http://127.0.0.1:8790/
+</code></pre>
+<p>Use that local URL for simulation, RC mapping, PPM, and autopilot workflows.
+The static GitHub Pages viewer and the Vite dev server can display telemetry,
+but they cannot start local native tools or access host hardware.</p>
 <h2 id="first-read"><a class="header" href="#first-read">First Read</a></h2>
 <p>Use the screen from top left to bottom right:</p>
 <ol>
 <li>Check the header for the active vehicle id and the theme/settings menu.</li>
+<li>Check the Ground Station strip for backend host, RC input, serial/PPM, and
+connection status.</li>
 <li>Check <strong>State I/O</strong> for whether expected Synapse topics are arriving.</li>
 <li>Use <strong>HUD</strong>, <strong>Map</strong>, and <strong>Vehicle</strong> for quick flight-state awareness.</li>
 <li>Use <strong>Manual Link</strong> and <strong>Control Surfaces</strong> to verify operator input and
@@ -200,6 +215,50 @@ debugging or recording a session.</li>
 menu. The settings menu currently contains the light/dark theme toggle.</p>
 <p>If the vehicle id is not the vehicle you expect, confirm the app was opened
 with the intended backend or Zenoh stream source.</p>
+<h2 id="ground-station-strip"><a class="header" href="#ground-station-strip">Ground Station Strip</a></h2>
+<p>The strip below the Dashboard/SIM tabs is the backend capability summary. It
+reports:</p>
+<ul>
+<li>The host serving <code>electrode-ground-station</code>.</li>
+<li>The detected RC input device.</li>
+<li>The serial/PPM device state.</li>
+<li>Whether the browser is connected to the local backend.</li>
+</ul>
+<p>If the strip is missing, you are in static Viewer mode. Open the app through
+the local daemon, usually <code>http://127.0.0.1:8790/</code>, instead of a static build or
+GitHub Pages URL.</p>
+<h2 id="dashboard-config"><a class="header" href="#dashboard-config">Dashboard Config</a></h2>
+<p>Open <strong>Dashboard Config</strong> when you need to adjust physical controls or output
+hardware.</p>
+<p><img src="assets/ui/groundstation-dashboard-config.png" alt="Ground Station dashboard config"></p>
+<h3 id="rc-mapping"><a class="header" href="#rc-mapping">RC Mapping</a></h3>
+<p><strong>RC Mapping</strong> maps the controller axes and buttons into Electrode’s manual
+control model. Use the live controller input bars on the right to identify
+which axis moves when you move a stick.</p>
+<ul>
+<li><strong>Axis</strong> chooses the raw controller axis.</li>
+<li><strong>Inv</strong> flips an axis direction.</li>
+<li><strong>MOM</strong> means momentary, active only while held.</li>
+<li><strong>TOG</strong> means toggle/latch.</li>
+</ul>
+<p>Changes save through the Ground Station backend and are reflected immediately
+in <strong>Manual Link</strong>.</p>
+<h3 id="ppm-hardware"><a class="header" href="#ppm-hardware">PPM Hardware</a></h3>
+<p><strong>PPM Hardware</strong> maps logical control sources to serial PPM output channels.
+Use it when Electrode is driving an external receiver or encoder.</p>
+<ul>
+<li>The channel rows define throttle, roll, pitch, yaw, and stabilization output.</li>
+<li><strong>Force throttle idle</strong> and <strong>Force stabilize</strong> are safety overrides.</li>
+<li><strong>Start PPM</strong> starts the native PPM bridge when a serial device is available.</li>
+</ul>
+<p>Use the live values to confirm channel order before connecting anything that
+can move actuators.</p>
+<p>For hardware-in-the-loop work, the autopilot can be a real flight-control board
+or the local <code>cubs2</code> native simulation. The PPM bridge does not run the
+autopilot; it selects between manual-control output and autopilot PWM output,
+then writes the selected PPM packet to the serial encoder/receiver hardware.
+Start the autopilot path first, verify <strong>Selected raw commands to
+sim/hardware</strong>, then start PPM output.</p>
 <h2 id="hud"><a class="header" href="#hud">HUD</a></h2>
 <p>The <strong>HUD</strong> is the quickest attitude readout. It summarizes standby/arming,
 roll, and pitch in the panel subtitle, then renders a flight-display style view
@@ -226,6 +285,8 @@ expects:</p>
 <p>Use this panel first when a downstream panel looks wrong. If State I/O says
 <code>no data</code> or <code>stale</code>, the UI is faithfully reporting that the topic has not
 arrived or has timed out.</p>
+<p>In Ground Station mode, the manual-control rows can update even without vehicle
+telemetry because the backend can publish local joystick state.</p>
 <h2 id="replay"><a class="header" href="#replay">Replay</a></h2>
 <p><strong>Replay</strong> loads MCAP recordings and feeds them through the same worker/state
 pipeline used by live data. Use the play/pause button, load button, timeline,
@@ -275,33 +336,147 @@ panel.</p>
 <h2 id="manual-link"><a class="header" href="#manual-link">Manual Link</a></h2>
 <p><strong>Manual Link</strong> displays controller sticks, arm/kill state, signal state, axis
 values, and the manual-control topic it is waiting for.</p>
-<p>In Ground Station mode, this panel can compare hardware joystick input and
-Zenoh manual-control messages. In static Viewer mode it can only show Zenoh
-state, so <code>NO SIGNAL</code> is expected until data arrives.</p>
+<p>In Ground Station mode, the <strong>Hardware</strong> tab shows locally computed joystick
+state before it leaves the machine. The <strong>Zenoh</strong> tab shows the actual
+<code>synapse/v1/topic/manual_control_command</code> stream after publication. Compare
+them when debugging mapping, transport, or stale-command behavior.</p>
+<p>When no RC controller is plugged in and the native manual publisher is stopped,
+Electrode enables a keyboard fallback. The Manual Link subtitle says
+<code>keyboard remote active</code> when this path is live.</p>
+<p>Keyboard controls:</p>
+<ul>
+<li>Arrow left/right: roll.</li>
+<li>Arrow up/down: pitch.</li>
+<li><code>A</code> / <code>D</code>: yaw.</li>
+<li><code>W</code> / <code>S</code>: throttle up/down.</li>
+<li><code>M</code>: toggle manual/autopilot mode request.</li>
+<li><code>T</code>: toggle stabilization active.</li>
+</ul>
+<p>The keyboard path is meant for bench testing and simulation bring-up, not for
+flying hardware.</p>
 <h2 id="vehicle"><a class="header" href="#vehicle">Vehicle</a></h2>
 <p><strong>Vehicle</strong> is the compact summary: altitude, speed, yaw, and quality. It is
 the panel to glance at when the larger HUD/Map panels are off screen.</p>
 <p>If <strong>Vehicle</strong> disagrees with <strong>HUD</strong> or <strong>Map</strong>, prefer <strong>State I/O</strong> as the
 source of truth and check whether one of the panels is using stale data.</p>
-<h2 id="mobile-layout"><a class="header" href="#mobile-layout">Mobile Layout</a></h2>
-<p>The same panels collapse into a single-column scanning flow on narrow screens.
-The order is intentionally status-first: header, HUD, State I/O, and then the
-rest of the operational/debug panels.</p>
-<p><img src="assets/ui/mobile-dashboard.png" alt="Electrode mobile dashboard"></p>
-<h2 id="ground-station-screenshots"><a class="header" href="#ground-station-screenshots">Ground Station Screenshots</a></h2>
-<p>The screenshots above are static Viewer screenshots. To document Ground
-Station-only controls precisely, capture the app while it is served by
-<code>electrode-ground-station</code> with your normal hardware or simulation profile
-active. Useful captures are:</p>
+<h2 id="sim-bring-up"><a class="header" href="#sim-bring-up">Sim Bring-Up</a></h2>
+<p>Use this sequence when you want the browser plant, local autopilot, manual
+input, and Ground Station display all working together.</p>
+<h3 id="1-open-the-full-ground-station"><a class="header" href="#1-open-the-full-ground-station">1. Open The Full Ground Station</a></h3>
+<p>Start the app through the Ground Station command if it is not already running:</p>
+<pre><code class="language-sh">npm run station
+</code></pre>
+<p>Then open the local daemon URL:</p>
+<pre><code class="language-text">http://127.0.0.1:8790/
+</code></pre>
+<p>Confirm the Ground Station strip says <strong>Connected</strong>. Also check the same strip
+for the RC input device and serial/PPM status. If the Ground Station strip is
+missing, you are in static Viewer mode and cannot start the local autopilot or
+simulation from the UI.</p>
+<h3 id="2-check-the-dashboard-config"><a class="header" href="#2-check-the-dashboard-config">2. Check The Dashboard Config</a></h3>
+<p>Open <strong>Dashboard Config</strong> before starting anything that can publish commands.</p>
+<p>Confirm <strong>RC Mapping</strong> moves the expected axes when you move the sticks. If an
+axis moves backward, flip <strong>Inv</strong> for that row. Confirm the mode switch row
+changes when you move the controller mode switch.</p>
+<p>Confirm <strong>PPM Hardware</strong> only if you are using serial PPM output. For pure
+simulation, PPM hardware can stay stopped.</p>
+<h3 id="3-start-manual-publishing"><a class="header" href="#3-start-manual-publishing">3. Start Manual Publishing</a></h3>
+<p>If an RC controller is attached, press <strong>Start</strong> in <strong>Manual Link</strong> when the
+manual publisher is stopped. The panel should show <strong>Hardware</strong> as live and the
+<code>manual_control_command</code> topic.</p>
+<p>If no RC controller is attached, leave the native manual publisher stopped and
+use the keyboard fallback. The panel should say <code>keyboard remote active</code>.</p>
+<p>Then check <strong>State I/O -&gt; Manual control state</strong>. It should show fresh data at
+roughly controller rate. If it says <code>waiting for manual_control_command</code>, fix
+manual publishing before starting the sim.</p>
+<h3 id="4-put-the-mode-switch-in-the-intended-mode"><a class="header" href="#4-put-the-mode-switch-in-the-intended-mode">4. Put The Mode Switch In The Intended Mode</a></h3>
+<p>The sim does not choose manual or autopilot mode. It behaves like the aircraft:
+the transmitter mode switch sends <code>manual_control_command.flight_mode</code>, and the
+autopilot decides whether to accept that mode.</p>
+<p>Use these checks:</p>
 <ul>
-<li>Dashboard with the Ground Station status bar and Dashboard config open.</li>
-<li>Firmware tab with the selected autopilot profile.</li>
-<li>SIM tab with the model editor visible.</li>
-<li>Manual Link with a real controller connected.</li>
-<li>Plots while replay or simulation samples are flowing.</li>
+<li>Manual mode: <strong>State I/O -&gt; Mode switch request</strong> should read <code>manual</code> or
+mode <code>0</code>.</li>
+<li>Autopilot mode: <strong>State I/O -&gt; Mode switch request</strong> should read <code>autopilot</code>
+or mode <code>1+</code>.</li>
+<li>Accepted autopilot mode: <strong>Autopilot reported</strong> should change to <code>auto</code>.</li>
+<li>Mismatch: if <strong>Mode switch request</strong> says <code>autopilot ... not accepted by autopilot</code>, the switch request is reaching Electrode but the autopilot has
+not accepted that mode yet.</li>
 </ul>
-<p>Those screenshots can be dropped into <code>docs/assets/ui/</code> and referenced from
-this page.</p>
+<p>For a closed-loop sim test, put the switch in autopilot mode and wait for
+<strong>Autopilot reported</strong> to show <code>auto</code>. For a manual plant test, leave the
+switch in manual mode and verify <strong>Control Surfaces</strong> responds to stick input.</p>
+<h3 id="5-start-the-autopilot"><a class="header" href="#5-start-the-autopilot">5. Start The Autopilot</a></h3>
+<p>On the Dashboard, find <strong>Autopilot</strong> and press <strong>Start</strong>. The panel should move
+from <code>stopped</code> to <code>running · pid ...</code>.</p>
+<p>For the default local workflow this starts the <code>cubs2</code> native simulation. For
+PPM or hardware-in-the-loop workflows, the autopilot may instead be a real
+flight-control board that boots on power; in that case use <strong>State I/O</strong> and
+<strong>Autopilot reported</strong> to verify it is producing telemetry before enabling PPM
+output.</p>
+<p>Watch <strong>Frames out</strong> and <strong>Frames in</strong>:</p>
+<ul>
+<li><strong>Frames out</strong> means Electrode is forwarding commands/sensor data toward the
+autopilot link.</li>
+<li><strong>Frames in</strong> means the autopilot is sending data back.</li>
+</ul>
+<p>If the process starts but frame counts stay at zero, check the Zenoh endpoint
+and the autopilot profile before debugging the UI.</p>
+<h3 id="6-start-the-sim-tab"><a class="header" href="#6-start-the-sim-tab">6. Start The SIM Tab</a></h3>
+<p>Open <strong>SIM</strong> and press <strong>Start</strong> in the Simulation panel. Leave the topic names
+at their defaults unless you intentionally changed the rest of the stack.</p>
+<p>After the sim starts, return to <strong>Dashboard</strong> and check:</p>
+<ul>
+<li><strong>Discovery</strong> should show new sim/autopilot topics.</li>
+<li><strong>State I/O -&gt; Mocap 6DOF pose</strong> should become fresh.</li>
+<li><strong>State I/O -&gt; Autopilot telemetry received</strong> should become fresh.</li>
+<li><strong>Map</strong> and <strong>HUD</strong> should stop showing only placeholder values once state is
+flowing.</li>
+</ul>
+<h3 id="7-verify-the-control-path"><a class="header" href="#7-verify-the-control-path">7. Verify The Control Path</a></h3>
+<p>Use the panels together:</p>
+<ol>
+<li><strong>Manual Link</strong>: confirms local joystick and published manual-control state.</li>
+<li><strong>State I/O</strong>: confirms the requested mode and whether the autopilot accepts
+it.</li>
+<li><strong>Selected raw commands to sim/hardware</strong>: confirms the command stream that
+the plant receives.</li>
+<li><strong>Control Surfaces</strong>: visualizes the selected output.</li>
+<li><strong>Plots</strong>: graph altitude, ground speed, attitude, or control fields once
+samples are flowing.</li>
+</ol>
+<h3 id="8-shut-down-in-reverse"><a class="header" href="#8-shut-down-in-reverse">8. Shut Down In Reverse</a></h3>
+<p>Stop the sim first, then stop the autopilot, then stop manual publishing if you
+are done with the controller. Export any logs before closing the tab.</p>
+<h2 id="sim"><a class="header" href="#sim">SIM</a></h2>
+<p>The <strong>SIM</strong> tab is the Rumoca TRUE SIL workbench. It runs the flight model in
+the browser tab with Rumoca WASM and uses the same Zenoh topic contract as the
+hardware path.</p>
+<p><img src="assets/ui/groundstation-sim.png" alt="Ground Station SIM tab"></p>
+<p>Use the left column to choose the vehicle kind, Rumoca project path, executable,
+Zenoh endpoint, and topic names. Use <strong>Start</strong> and <strong>Stop</strong> to control the
+in-browser plant.</p>
+<p>Use the editor on the right to inspect or edit the Modelica file. <strong>Reload</strong>
+pulls the file from disk, <strong>Check</strong> validates the configured model, and <strong>Save</strong>
+writes changes when the file is editable.</p>
+<p>Simulation publishes mocap-like pose output and consumes the selected actuator
+command stream, so it is most useful when checking the whole command path:</p>
+<ol>
+<li>Start manual publishing.</li>
+<li>Put the mode switch in the intended mode.</li>
+<li>Start the autopilot.</li>
+<li>Start the sim.</li>
+<li>Confirm the command, sensor, and telemetry topics in <strong>Discovery</strong>.</li>
+<li>Confirm <strong>State I/O</strong> receives fresh mocap and telemetry.</li>
+<li>Use <strong>HUD</strong>, <strong>Map</strong>, <strong>Plots</strong>, and <strong>Manual Link</strong> to inspect behavior.</li>
+</ol>
+<h2 id="static-viewer-mode"><a class="header" href="#static-viewer-mode">Static Viewer Mode</a></h2>
+<p>Static Viewer mode is what the same app shows when no local Ground Station
+daemon answers <code>gcs/health</code>. Hardware panels, Dashboard Config, and SIM are not
+available, but live Zenoh-over-WebSocket, replay, logging, plots, discovery,
+and visualization still work.</p>
+<p><img src="assets/ui/dashboard-tall.png" alt="Static Viewer dashboard"></p>
+<p>Use <code>?viewer</code> to force this mode even when the app is served by the daemon.</p>
 
                     </main>
 
