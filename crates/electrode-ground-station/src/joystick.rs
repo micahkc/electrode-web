@@ -3,11 +3,11 @@
 //! which stick/button (independent of any mapping).
 
 use std::io::Read;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use axum::extract::Query;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::Query;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

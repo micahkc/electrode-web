@@ -484,7 +484,9 @@
 
   function toggleThemeFromMenu(event: MouseEvent): void {
     toggleTheme();
-    event.currentTarget instanceof HTMLElement && event.currentTarget.closest('details')?.removeAttribute('open');
+    if (event.currentTarget instanceof HTMLElement) {
+      event.currentTarget.closest('details')?.removeAttribute('open');
+    }
   }
 
   function connect(): void {

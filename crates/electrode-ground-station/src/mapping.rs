@@ -186,10 +186,9 @@ mod tests {
     fn ppm_bridge_args_use_sport_cub_aetrm_serial_order() {
         let args = MappingProfile::default().ppm_bridge_args();
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--channel-map", "1,2,0,3,4"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--channel-map", "1,2,0,3,4"]));
     }
 
     #[test]
@@ -200,17 +199,14 @@ mod tests {
         };
         let args = profile.ppm_bridge_args();
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--channel-invert", "true,false,true,false,true"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--force-idle-throttle", "false"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--force-stabilizing-mode", "false"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--channel-invert", "true,false,true,false,true"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--force-idle-throttle", "false"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--force-stabilizing-mode", "false"]));
     }
 }

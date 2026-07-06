@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use electrode_ppm_bridge::{
-    FAILSAFE_CHANNELS, PpmChannels, channels_to_pwm_signal_outputs_payload,
-    manual_control_to_channels, pwm_signal_outputs_to_channels,
+    channels_to_pwm_signal_outputs_payload, manual_control_to_channels,
+    pwm_signal_outputs_to_channels, PpmChannels, FAILSAFE_CHANNELS,
 };
 use synapse_fbs::topic::{
     ManualControlData, ManualControlFlags, MocapDefinition, MocapDefinitionArgs, MocapFrame,

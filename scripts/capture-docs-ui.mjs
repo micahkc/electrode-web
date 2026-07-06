@@ -126,19 +126,6 @@ try {
   browser.kill('SIGTERM');
 }
 
-async function waitForJson(url) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    try {
-      const response = await fetch(url);
-      if (response.ok) return await response.json();
-    } catch {
-      // Chrome is still starting.
-    }
-    await delay(100);
-  }
-  throw new Error(`timed out waiting for ${url}`);
-}
-
 async function newPageTarget(port) {
   const url = `http://127.0.0.1:${port}/json/new?about:blank`;
   for (let attempt = 0; attempt < 50; attempt += 1) {
