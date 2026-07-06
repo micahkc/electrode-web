@@ -136,7 +136,10 @@ impl Default for SimulationProfile {
             command_input_topic: "synapse/motor_output".to_string(),
             actuator_output_topic: "synapse/motor_output".to_string(),
             sensor_output_topic: "synapse/v1/sim/sensors".to_string(),
-            telemetry_output_topic: "synapse/mocap/rigid_body/cub1/pose".to_string(),
+            // Private plant topic: the sim bridge republishes it on the public
+            // Qualisys-bridge-parity mocap topics (frame + compact pose +
+            // definition), so the plant never writes public keys directly.
+            telemetry_output_topic: crate::sim_bridge::PRIVATE_MOCAP_TOPIC.to_string(),
             executable: std::env::var("ELECTRODE_RUMOCA_SIM_BIN")
                 .unwrap_or_else(|_| "rumoca".to_string()),
             schema_bfbs_dir: default_schema_bfbs_dir(),
@@ -320,6 +323,7 @@ impl SimulationProfile {
             || self.telemetry_output_topic == "synapse/sim/telemetry"
             || self.telemetry_output_topic == "synapse/sim_input"
             || self.telemetry_output_topic == "synapse/mocap/frame"
+            || self.telemetry_output_topic == "synapse/mocap/rigid_body/cub1/pose"
             || self.telemetry_output_topic == "synapse/v1/topic/mocap_frame"
             || self.telemetry_output_topic == "synapse/v1/sil/sim_input"
         {
@@ -836,9 +840,11 @@ mod tests {
     fn generated_config_targets_synapse_0_3_0() {
         let profile = SimulationProfile::default();
         assert_eq!(profile.command_input_topic, "synapse/motor_output");
+        // The plant writes the private topic; the sim bridge owns the public
+        // Qualisys-parity mocap keys.
         assert_eq!(
             profile.telemetry_output_topic,
-            "synapse/mocap/rigid_body/cub1/pose"
+            "electrode/sim/rumoca/mocap_frame"
         );
 
         let text = GENERATED_RUMOCA_CONFIG;
@@ -875,7 +881,19 @@ mod tests {
         assert_eq!(profile.command_input_topic, "synapse/motor_output");
         assert_eq!(
             profile.telemetry_output_topic,
-            "synapse/mocap/rigid_body/cub1/pose"
+            "electrode/sim/rumoca/mocap_frame"
+        );
+
+        // Profiles that published the public pose key directly migrate too —
+        // only the sim bridge writes public mocap topics now.
+        let mut direct = SimulationProfile {
+            telemetry_output_topic: "synapse/mocap/rigid_body/cub1/pose".to_string(),
+            ..Default::default()
+        };
+        direct.normalize();
+        assert_eq!(
+            direct.telemetry_output_topic,
+            "electrode/sim/rumoca/mocap_frame"
         );
     }
 

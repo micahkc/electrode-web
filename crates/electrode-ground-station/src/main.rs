@@ -31,7 +31,7 @@ use axum::{Json, Router};
 use clap::Parser;
 use serde::Serialize;
 
-use autopilot::{AutopilotProfile, FirmwareInstallRequest, FirmwareInstallStatus};
+use autopilot::AutopilotProfile;
 use autopilot_link::{AutopilotLink, AutopilotRunStatus};
 use mapping::MappingProfile;
 use simulation::{
@@ -85,7 +85,6 @@ struct AppState {
     mapping_file: PathBuf,
     autopilot: RwLock<AutopilotProfile>,
     autopilot_file: PathBuf,
-    last_install: RwLock<Option<FirmwareInstallStatus>>,
     simulation: RwLock<SimulationProfile>,
     simulation_file: PathBuf,
     simulation_supervisor: SimulationSupervisor,
@@ -185,32 +184,6 @@ async fn autopilot_start(
 
 async fn autopilot_stop(State(state): State<Shared>) -> Json<AutopilotRunStatus> {
     Json(tokio::task::block_in_place(|| state.autopilot_link.stop()))
-}
-
-async fn firmware_install(
-    State(state): State<Shared>,
-    Json(request): Json<FirmwareInstallRequest>,
-) -> Json<FirmwareInstallStatus> {
-    let profile = state
-        .autopilot
-        .read()
-        .expect("autopilot lock poisoned")
-        .clone();
-    let status = profile.install_plan(request);
-    *state.last_install.write().expect("install lock poisoned") = Some(status.clone());
-    Json(status)
-}
-
-async fn firmware_install_status(
-    State(state): State<Shared>,
-) -> Json<Option<FirmwareInstallStatus>> {
-    Json(
-        state
-            .last_install
-            .read()
-            .expect("install lock poisoned")
-            .clone(),
-    )
 }
 
 async fn get_simulation(State(state): State<Shared>) -> Json<SimulationProfile> {
@@ -428,7 +401,6 @@ async fn main() -> anyhow::Result<()> {
         mapping_file: cli.mapping_file.clone(),
         autopilot: RwLock::new(AutopilotProfile::load_or_default(&cli.autopilot_file)),
         autopilot_file: cli.autopilot_file.clone(),
-        last_install: RwLock::new(None),
         simulation: RwLock::new(SimulationProfile::load_or_default(&cli.simulation_file)),
         simulation_file: cli.simulation_file.clone(),
         simulation_supervisor: SimulationSupervisor::new(),
@@ -450,10 +422,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/autopilot/status", get(autopilot_run_status))
         .route("/autopilot/start", post(autopilot_start))
         .route("/autopilot/stop", post(autopilot_stop))
-        .route(
-            "/firmware/install",
-            get(firmware_install_status).post(firmware_install),
-        )
         .route("/simulation", get(get_simulation).put(put_simulation))
         .route(
             "/simulation/model",

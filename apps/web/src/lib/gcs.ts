@@ -61,38 +61,6 @@ export interface BridgeStatus {
   ppmBin?: string;
 }
 
-export type FirmwareSource = 'localBuild' | 'releaseArtifact' | 'ciArtifact' | 'customFile';
-export type FlashMethod = 'usbBootloader' | 'dfu' | 'serialBootloader' | 'sdCard' | 'externalTool';
-export type RuntimeTransport = 'zenoh' | 'mavlinkSerial' | 'mavlinkUdp' | 'mavlinkTcp';
-export type RuntimeProtocol = 'synapseZenoh' | 'mavlink';
-
-export interface AutopilotProfile {
-  stackName: string;
-  stackPath: string;
-  firmwareSource: FirmwareSource;
-  firmwareArtifact: string;
-  boardTarget: string;
-  flashMethod: FlashMethod;
-  runtimeTransport: RuntimeTransport;
-  runtimeEndpoint: string;
-  missionProtocol: RuntimeProtocol;
-  parameterProtocol: RuntimeProtocol;
-  calibrationProtocol: RuntimeProtocol;
-  nativeBinary?: string;
-  udpRxPort?: number;
-  udpTxPort?: number;
-  inboundTopics?: string[];
-}
-
-export interface FirmwareInstallStatus {
-  jobId: string;
-  status: 'planned' | 'rejected';
-  message: string;
-  profile: AutopilotProfile;
-  device: string;
-  steps: string[];
-}
-
 export type SimulationBackend = 'rumoca';
 export type SimulationMode = 'withAutopilot' | 'directCommands';
 export type SimulationVehicleKind = 'fixedWing' | 'quadrotor';
@@ -206,26 +174,6 @@ export async function setPpmBridgeRunning(running: boolean): Promise<BridgeStatu
   return (await response.json()) as BridgeStatus;
 }
 
-export async function fetchAutopilotProfile(signal?: AbortSignal): Promise<AutopilotProfile> {
-  const response = await fetch(gcsUrl('autopilot'), { signal });
-  if (!response.ok) {
-    throw new Error(`gcs/autopilot responded ${response.status}`);
-  }
-  return (await response.json()) as AutopilotProfile;
-}
-
-export async function saveAutopilotProfile(profile: AutopilotProfile): Promise<AutopilotProfile> {
-  const response = await fetch(gcsUrl('autopilot'), {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(profile)
-  });
-  if (!response.ok) {
-    throw new Error(`saving autopilot profile failed (${response.status})`);
-  }
-  return (await response.json()) as AutopilotProfile;
-}
-
 /** Live state of the daemon-supervised native autopilot (cubs2 native_sim + Zenoh link). */
 export interface AutopilotRunStatus {
   running: boolean;
@@ -255,26 +203,6 @@ export async function setAutopilotRunning(action: 'start' | 'stop'): Promise<Aut
     throw new Error(detail || `autopilot ${action} failed (${response.status})`);
   }
   return (await response.json()) as AutopilotRunStatus;
-}
-
-export async function planFirmwareInstall(device: string, confirmed: boolean): Promise<FirmwareInstallStatus> {
-  const response = await fetch(gcsUrl('firmware/install'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ device, confirmed })
-  });
-  if (!response.ok) {
-    throw new Error(`firmware install request failed (${response.status})`);
-  }
-  return (await response.json()) as FirmwareInstallStatus;
-}
-
-export async function fetchFirmwareInstallStatus(signal?: AbortSignal): Promise<FirmwareInstallStatus | null> {
-  const response = await fetch(gcsUrl('firmware/install'), { signal });
-  if (!response.ok) {
-    throw new Error(`gcs/firmware/install responded ${response.status}`);
-  }
-  return (await response.json()) as FirmwareInstallStatus | null;
 }
 
 export async function fetchSimulationProfile(signal?: AbortSignal): Promise<SimulationProfile> {
