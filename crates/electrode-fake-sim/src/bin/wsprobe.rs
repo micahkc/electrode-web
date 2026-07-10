@@ -6,7 +6,8 @@
 //!   cargo run -p electrode-fake-sim --bin wsprobe -- peer synapse/** 5
 use synapse_fbs::topic::{
     AttitudeEstimateData, AttitudeEstimateFlags, ManualControlData, ManualControlFlags,
-    PwmSignalOutputsData, RadioControlData, VehicleHealthData, VehicleHealthFlags,
+    MocapDefinition, MocapFrame, PwmSignalOutputsData, RadioControlData, VehicleHealthData,
+    VehicleHealthFlags,
 };
 use zenoh::Wait;
 
@@ -162,6 +163,61 @@ fn decode_sample(key: &str, bytes: &[u8]) -> String {
             value(5),
             value(6)
         );
+    }
+    if key.ends_with("/mocap/frame") {
+        if let Ok(frame) = flatbuffers::root::<MocapFrame>(bytes) {
+            let bodies = frame.rigid_bodies();
+            let mut body_text = Vec::new();
+            if let Some(bodies) = bodies {
+                for body in bodies.iter() {
+                    let p = body.position_enu_m();
+                    let q = body.attitude();
+                    let (roll, pitch, yaw) = euler_deg(q.w(), q.x(), q.y(), q.z());
+                    body_text.push(format!(
+                        "id={} p=[{:.3},{:.3},{:.3}] q_wxyz=[{:.4},{:.4},{:.4},{:.4}] rpy_deg=[{:.1},{:.1},{:.1}] residual={:.4} valid={}",
+                        body.id(),
+                        p.x(),
+                        p.y(),
+                        p.z(),
+                        q.w(),
+                        q.x(),
+                        q.y(),
+                        q.z(),
+                        roll,
+                        pitch,
+                        yaw,
+                        body.residual(),
+                        body.tracking_valid()
+                    ));
+                }
+            }
+            return format!(
+                "mocap_frame timestamp_us={} frame={} bodies={}",
+                frame.timestamp_us(),
+                frame.frame_number(),
+                body_text.join("; ")
+            );
+        }
+    }
+    if key.ends_with("/mocap/definition") {
+        if let Ok(definition) = flatbuffers::root::<MocapDefinition>(bytes) {
+            let mut body_text = Vec::new();
+            if let Some(bodies) = definition.rigid_bodies() {
+                for body in bodies.iter() {
+                    body_text.push(format!(
+                        "id={} name={}",
+                        body.id(),
+                        body.name().unwrap_or("")
+                    ));
+                }
+            }
+            return format!(
+                "mocap_definition source={} frame_id={} bodies={}",
+                definition.source().unwrap_or(""),
+                definition.frame_id().unwrap_or(""),
+                body_text.join(", ")
+            );
+        }
     }
     if key.ends_with("radio_control") && bytes.len() == 48 {
         let data = unsafe { <RadioControlData as flatbuffers::Follow>::follow(bytes, 0) };

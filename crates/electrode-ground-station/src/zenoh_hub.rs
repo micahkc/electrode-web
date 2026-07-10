@@ -59,6 +59,12 @@ pub(crate) struct ZenohHub {
 }
 
 impl ZenohHub {
+    /// The hub's own session — the mesh listener every participant attaches
+    /// to, so subscribers declared here see all traffic.
+    pub(crate) fn session(&self) -> Option<zenoh::Session> {
+        self._session.clone()
+    }
+
     pub(crate) fn start(config: ZenohHubConfig) -> anyhow::Result<Self> {
         if !config.enabled {
             tracing::info!("ground-station Zenoh hub disabled");
