@@ -19,6 +19,13 @@
   export let secondaryAttitude: Attitude | null = null;
   export let primaryLabel = '';
   export let secondaryLabel = '';
+  /**
+   * Comparison mode: the model stands for a named source, so it is hidden when
+   * that source has no attitude. Separate from the labels, because with every
+   * source hidden there is no primary to name and a level model would read as
+   * "level" rather than "nothing selected".
+   */
+  export let compareSources = false;
   export let primaryColor = '#fd7719';
   export let secondaryColor = '#35d0ff';
 
@@ -50,7 +57,7 @@
   $: elevator = controls?.elevator ?? 0;
   $: rudder = controls?.rudder ?? 0;
   $: throttle = controls?.throttle ?? 0;
-  $: showSources = primaryLabel.trim().length > 0;
+  $: showSources = compareSources;
 
   $: if (mounted && scene) {
     void loadVehicle(vehicleType);
@@ -222,7 +229,7 @@
     // With two sources named, the model stands for the primary one: a level
     // model under its label would read as "this source says level" when the
     // truth is that it says nothing.
-    bodyPivot.visible = !showSources || attitude !== null;
+    bodyPivot.visible = !showSources || (attitude !== null && primaryLabel.trim().length > 0);
     bodyPivot.rotation.set(
       three.MathUtils.degToRad(pitchDeg),
       -three.MathUtils.degToRad(yawDeg),
@@ -308,21 +315,29 @@
 
     {#if showSources}
       <div class="attitude-sources">
-        <div class="attitude-source">
-          <span class="swatch" style={`background:${primaryColor};`}></span>
-          <span class="source-name">{primaryLabel}</span>
-          <strong>{attitude ? `${rollDeg.toFixed(0)}° ${pitchDeg.toFixed(0)}° ${yawDeg.toFixed(0)}°` : 'no data'}</strong>
-        </div>
-        <div class="attitude-source">
-          <span class="swatch outline" style={`border-color:${secondaryColor};`}></span>
-          <span class="source-name">{secondaryLabel}</span>
-          <strong>
-            {secondaryAttitude
-              ? `${secondaryAttitude.rollDeg.toFixed(0)}° ${secondaryAttitude.pitchDeg.toFixed(0)}° ${secondaryAttitude.yawDeg.toFixed(0)}°`
-              : 'no data'}
-          </strong>
-        </div>
-        <div class="attitude-source axes"><span class="swatch spacer"></span><span class="source-name"></span><strong>roll · pitch · yaw</strong></div>
+        {#if primaryLabel}
+          <div class="attitude-source">
+            <span class="swatch" style={`background:${primaryColor};`}></span>
+            <span class="source-name">{primaryLabel}</span>
+            <strong>{attitude ? `${rollDeg.toFixed(0)}° ${pitchDeg.toFixed(0)}° ${yawDeg.toFixed(0)}°` : 'no data'}</strong>
+          </div>
+        {/if}
+        {#if secondaryLabel}
+          <div class="attitude-source">
+            <span class="swatch outline" style={`border-color:${secondaryColor};`}></span>
+            <span class="source-name">{secondaryLabel}</span>
+            <strong>
+              {secondaryAttitude
+                ? `${secondaryAttitude.rollDeg.toFixed(0)}° ${secondaryAttitude.pitchDeg.toFixed(0)}° ${secondaryAttitude.yawDeg.toFixed(0)}°`
+                : 'no data'}
+            </strong>
+          </div>
+        {/if}
+        {#if primaryLabel}
+          <div class="attitude-source axes"><span class="swatch spacer"></span><span class="source-name"></span><strong>roll · pitch · yaw</strong></div>
+        {:else}
+          <div class="attitude-source axes"><span class="swatch spacer"></span><strong>no source shown</strong></div>
+        {/if}
       </div>
     {:else}
       <div class="attitude-readout">

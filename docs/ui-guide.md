@@ -63,9 +63,14 @@ it oriented": what the vehicle telemeters over the radio, and what the motion
 capture system sees. Both are drawn at once so they can be compared, in the 3D
 scene and in Control Surfaces:
 
-- The **Telemetry / Mocap** buttons in the Map toolbar pick which source drives
-  the solid vehicle model. That source is named on a coloured label above the
-  vehicle with a matching ring on the floor beneath it.
+- The **Telemetry** and **Mocap** buttons in the Map toolbar are two
+  independent toggles, not a two-way switch: both, one, or neither can be
+  shown. Comparing the sources means seeing both, and isolating one means
+  hiding the other rather than promoting it. Each button carries its source's
+  colour, dimmed when that source is hidden.
+- Whichever enabled source is drawn with the solid vehicle model — telemetry
+  first when both are on — is named on a coloured label above the vehicle with
+  a matching ring on the floor beneath it.
 - The other source is drawn as a **wire outline** in its own colour, with its
   own label, floor ring and flight trail. In Control Surfaces it is the wire
   airframe overlaid on the top and rear views.
@@ -77,7 +82,9 @@ scene and in Control Surfaces:
 
 Neither source is ever filled in from the other. A source with no data reads
 `no pose` / `no data` and its marker is not drawn, so two markers agreeing
-always means the sources agree.
+always means the sources agree. With both toggles off nothing is drawn at all —
+the model is hidden rather than shown level, which would read as an attitude
+rather than as an absence.
 
 ## Header
 

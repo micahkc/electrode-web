@@ -54,8 +54,10 @@
     createPlotPacketCatalog,
     createInitialVehicleState,
     plotPacketKey,
+    type Attitude,
     type ConnectionState,
     type MissionWaypoint,
+    type Pose,
     type PlotFieldDefinition,
     type PlotPacketDefinition,
     type PlotSeries,
@@ -115,6 +117,26 @@
     { key: 'telemetry', label: 'Telemetry' },
     { key: 'mocap', label: 'Mocap' }
   ];
+
+  function poseForSource(
+    source: OdomSource | null,
+    fromTelemetry: Pose | null,
+    fromMocap: Pose | null
+  ): Pose | null {
+    if (source === 'telemetry') return fromTelemetry;
+    if (source === 'mocap') return fromMocap;
+    return null;
+  }
+
+  function attitudeForSource(
+    source: OdomSource | null,
+    fromTelemetry: Attitude | null,
+    fromMocap: Attitude | null
+  ): Attitude | null {
+    if (source === 'telemetry') return fromTelemetry;
+    if (source === 'mocap') return fromMocap;
+    return null;
+  }
   /**
    * Fixed colour per source, so the identity of a marker never depends on
    * which of the two is currently driving the vehicle model.
@@ -233,7 +255,10 @@
   let theme: ThemeName = 'dark';
   let activePage: GroundStationPage = initialGroundStationPage();
   let dashboardProfile: DashboardProfile = initialDashboardProfile();
-  let odomSource: OdomSource = 'telemetry';
+  // Independent, not a two-way switch: comparing the sources means seeing both,
+  // and isolating one means hiding the other rather than promoting it.
+  let showTelemetryView = true;
+  let showMocapView = true;
   let runtimeMode: RuntimeMode = 'zenoh';
   let mapViewMode: MapViewMode = initialMapViewMode();
   let selectedVehicleType: VehicleKind =
@@ -317,47 +342,61 @@
 
   // What the 3D view draws. Telemetry odometry is the estimator's attitude with
   // position from GNSS; mocap is the local frame the capture system owns. The
-  // selected source drives the vehicle model and every derived readout; the
-  // other is drawn beside it as a labelled wire marker. The selected one falls
-  // back to the canonical pose so the view is never blank with one source only.
-  // The odometry selector is drone-only, so the plane keeps the canonical pose
-  // rather than being reprojected through the drone's geodetic calibration.
+  // The two sources are shown independently: each has its own toggle, so both,
+  // one, or neither can be on the screen. The one drawn with the solid vehicle
+  // model is whichever is enabled, telemetry first when both are; the other
+  // gets the wire marker. Their colours are fixed, so which is which never
+  // depends on that choice.
+  //
+  // The selector is drone-only, so the plane keeps the canonical pose rather
+  // than being reprojected through the drone's geodetic calibration.
   //
   // No cross-source fallback on the drone: once a marker carries a source's
   // name, filling it in from the other source would make the two agree exactly
   // whenever one of them is missing — the one reading that must never be
   // fabricated. A source with no data is drawn as absent instead.
+  $: enabledSources = (
+    dashboardProfile !== 'drone'
+      ? []
+      : [
+          ...(showTelemetryView ? (['telemetry'] as const) : []),
+          ...(showMocapView ? (['mocap'] as const) : [])
+        ]
+  ) as OdomSource[];
+  $: primarySource = enabledSources[0] ?? null;
+  $: secondarySource = enabledSources[1] ?? null;
   $: displayPose =
-    dashboardProfile !== 'drone' ? pose : odomSource === 'telemetry' ? telemetryPose : mocapPose;
+    dashboardProfile !== 'drone' ? pose : poseForSource(primarySource, telemetryPose, mocapPose);
   $: displayAttitude =
     dashboardProfile !== 'drone'
       ? attitude
-      : odomSource === 'telemetry'
-        ? telemetryAttitude
-        : mocapAttitude;
-  $: comparePose = odomSource === 'telemetry' ? mocapPose : telemetryPose;
-  $: compareAttitude = odomSource === 'telemetry' ? mocapAttitude : telemetryAttitude;
-  $: compareSource = (odomSource === 'telemetry' ? 'mocap' : 'telemetry') as OdomSource;
+      : attitudeForSource(primarySource, telemetryAttitude, mocapAttitude);
+  $: comparePose = poseForSource(secondarySource, telemetryPose, mocapPose);
+  $: compareAttitude = attitudeForSource(secondarySource, telemetryAttitude, mocapAttitude);
   // Empty labels switch the two-source overlay off, which is what the plane
   // dashboard wants: it has one source and nothing to disambiguate.
-  $: primarySourceLabel = dashboardProfile === 'drone' ? odomSource : '';
-  $: secondarySourceLabel = dashboardProfile === 'drone' ? compareSource : '';
+  $: primarySourceLabel = primarySource ?? '';
+  $: secondarySourceLabel = secondarySource ?? '';
   $: ghostNote =
     dashboardProfile !== 'drone'
       ? ''
-      : comparePose
-        ? ` · vs ${compareSource}`
-        : odomSource === 'telemetry'
-          ? ' · no mocap to compare'
-          : ' · no GNSS to compare';
+      : enabledSources.length === 0
+        ? ' · no source shown'
+        : secondarySource === null
+          ? ` · ${primarySource} only`
+          : comparePose
+            ? ` · vs ${secondarySource}`
+            : ` · no ${secondarySource} to compare`;
   $: odomSourceNote =
-    odomSource === 'telemetry'
-      ? gnss?.positionValid
-        ? 'GNSS + estimator'
-        : 'estimator only · no GNSS lock'
-      : vehicle.localization.source.startsWith('mocap')
-        ? `${vehicle.localization.source} · ${vehicle.localization.fresh ? 'fresh' : 'stale'}`
-        : 'no mocap source';
+    primarySource === null
+      ? 'nothing drawn'
+      : primarySource === 'telemetry'
+        ? gnss?.positionValid
+          ? 'GNSS + estimator'
+          : 'estimator only · no GNSS lock'
+        : vehicle.localization.source.startsWith('mocap')
+          ? `${vehicle.localization.source} · ${vehicle.localization.fresh ? 'fresh' : 'stale'}`
+          : 'no mocap source';
   $: mission = vehicle.mission;
   // 2D map projection of the mission plan, using the same metres→percent
   // mapping as the vehicle marker.
@@ -1721,18 +1760,25 @@ disconnects the link."
         </div>
         <div class="map-tools">
           {#if dashboardProfile === 'drone'}
-            <!-- Also selects which source drives Control Surfaces and the HUD,
-                 so it stays available in 2D. -->
-            <div class="map-view-control" aria-label="Odometry source">
+            <!-- Two independent toggles, not a two-way switch: comparing the
+                 sources means seeing both. Also drives Control Surfaces, so it
+                 stays available in 2D. -->
+            <div class="map-view-control source-toggles" aria-label="Odometry sources shown">
               {#each odomSources as option}
                 <button
                   type="button"
-                  class:active={odomSource === option.key}
+                  aria-pressed={option.key === 'telemetry' ? showTelemetryView : showMocapView}
+                  class:active={option.key === 'telemetry' ? showTelemetryView : showMocapView}
                   onclick={() => {
-                    odomSource = option.key;
+                    if (option.key === 'telemetry') {
+                      showTelemetryView = !showTelemetryView;
+                    } else {
+                      showMocapView = !showMocapView;
+                    }
                   }}
-                  title="Drive the vehicle model from {option.label.toLowerCase()} odometry; the other source is drawn beside it"
+                  title="Show or hide {option.label.toLowerCase()} odometry. Both can be on at once."
                 >
+                  <span class="source-dot" style={`background:${SOURCE_COLORS[option.key]};`}></span>
                   {option.label}
                 </button>
               {/each}
@@ -1812,8 +1858,9 @@ disconnects the link."
           secondaryAttitude={dashboardProfile === 'drone' ? compareAttitude : null}
           primaryLabel={primarySourceLabel}
           secondaryLabel={secondarySourceLabel}
-          primaryColor={SOURCE_COLORS[odomSource]}
-          secondaryColor={SOURCE_COLORS[compareSource]}
+          compareSources={dashboardProfile === 'drone'}
+          primaryColor={primarySource ? SOURCE_COLORS[primarySource] : '#fd7719'}
+          secondaryColor={secondarySource ? SOURCE_COLORS[secondarySource] : '#35d0ff'}
           localizationQuality={vehicle.localization.quality}
           {theme}
           bind:vehicleType={selectedVehicleType}
@@ -1827,7 +1874,7 @@ disconnects the link."
           <h2>Control Surfaces</h2>
           <p>
             deflection · top &amp; rear{dashboardProfile === 'drone'
-              ? ` · ${odomSource} vs ${compareSource}`
+              ? ` · ${enabledSources.length > 0 ? enabledSources.join(' + ') : 'no source shown'}`
               : ''}
           </p>
         </div>
@@ -1838,8 +1885,9 @@ disconnects the link."
         secondaryAttitude={dashboardProfile === 'drone' ? compareAttitude : null}
         primaryLabel={primarySourceLabel}
         secondaryLabel={secondarySourceLabel}
-        primaryColor={SOURCE_COLORS[odomSource]}
-        secondaryColor={SOURCE_COLORS[compareSource]}
+        compareSources={dashboardProfile === 'drone'}
+        primaryColor={primarySource ? SOURCE_COLORS[primarySource] : '#fd7719'}
+        secondaryColor={secondarySource ? SOURCE_COLORS[secondarySource] : '#35d0ff'}
         controls={deflectionControls}
         {motors}
         {theme}
@@ -3928,6 +3976,25 @@ disconnects the link."
     /* Panels are sized by their row span, so anything taller is clipped. Scroll
        rather than silently hide a topic the operator is looking for. */
     overflow-y: auto;
+  }
+
+  /* Independent toggles rather than a segmented picker, so an inactive one
+     reads as "hidden" instead of "the other one is selected". */
+  .source-toggles button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .source-toggles .source-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    opacity: 0.35;
+  }
+
+  .source-toggles button.active .source-dot {
+    opacity: 1;
   }
 
   .mocap-panel {

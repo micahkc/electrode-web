@@ -32,6 +32,13 @@
    */
   export let primaryLabel = '';
   export let secondaryLabel = '';
+  /**
+   * Comparison mode: the vehicle model stands for a named source rather than
+   * for "the vehicle", so it is hidden when that source has nothing to say.
+   * Independent of the labels, because with every source hidden there is no
+   * primary to name and the view must still not fall back to a plain model.
+   */
+  export let compareSources = false;
   export let primaryColor = '#fd7719';
   export let secondaryColor = '#35d0ff';
   export let theme: 'light' | 'dark' = 'dark';
@@ -159,11 +166,11 @@
   $: localX = pose?.xM ?? 0;
   $: localY = pose?.yM ?? 0;
   $: localAlt = pose?.altM ?? 0;
-  $: showSources = primaryLabel.trim().length > 0;
+  $: showSources = compareSources;
   $: updateVehicle(pose, attitude);
   $: updateMission(mission);
   $: applyTheme(theme);
-  $: updateSourceOverlay(primaryLabel, secondaryLabel, primaryColor, secondaryColor, theme);
+  $: updateSourceOverlay(primaryLabel, secondaryLabel, primaryColor, secondaryColor, theme, compareSources);
   $: updateSecondary(secondaryPose, secondaryAttitude);
   // Straight-line disagreement between the two sources: the number that says
   // whether the vehicle has actually converged onto mocap.
@@ -261,8 +268,15 @@
 
     updateVehicle(pose, attitude);
     updateMission(mission);
-    // Signature starts empty, so this builds the overlay when sources are named.
-    updateSourceOverlay(primaryLabel, secondaryLabel, primaryColor, secondaryColor, theme);
+    // Signature starts empty, so this builds the overlay in comparison mode.
+    updateSourceOverlay(
+      primaryLabel,
+      secondaryLabel,
+      primaryColor,
+      secondaryColor,
+      theme,
+      compareSources
+    );
   }
 
   function createTrail(color: three.ColorRepresentation, opacity: number): Trail {
@@ -662,18 +676,19 @@
     nextSecondary: string,
     nextPrimaryColor: string,
     nextSecondaryColor: string,
-    nextTheme: 'light' | 'dark'
+    nextTheme: 'light' | 'dark',
+    nextCompare: boolean
   ): void {
     if (!scene) {
       return;
     }
-    const signature = `${nextPrimary}|${nextSecondary}|${nextPrimaryColor}|${nextSecondaryColor}|${nextTheme}`;
+    const signature = `${nextPrimary}|${nextSecondary}|${nextPrimaryColor}|${nextSecondaryColor}|${nextTheme}|${nextCompare}`;
     if (signature === sourceSignature) {
       return;
     }
     sourceSignature = signature;
     clearSourceOverlay();
-    if (!nextPrimary.trim()) {
+    if (!nextCompare) {
       return;
     }
     buildSourceOverlay(nextPrimary, nextSecondary, nextPrimaryColor, nextSecondaryColor);
@@ -688,11 +703,13 @@
   ): void {
     const group = new three.Group();
 
-    primaryHalo = createSourceHalo(HALO_RADIUS_SCENE, colorPrimary);
-    group.add(primaryHalo);
-    primaryLabelSprite = createSourceLabel(labelPrimary, colorPrimary, pal.labelShadow);
-    primaryLabelSprite.scale.set(LABEL_SCALE[0], LABEL_SCALE[1], 1);
-    group.add(primaryLabelSprite);
+    if (labelPrimary.trim()) {
+      primaryHalo = createSourceHalo(HALO_RADIUS_SCENE, colorPrimary);
+      group.add(primaryHalo);
+      primaryLabelSprite = createSourceLabel(labelPrimary, colorPrimary, pal.labelShadow);
+      primaryLabelSprite.scale.set(LABEL_SCALE[0], LABEL_SCALE[1], 1);
+      group.add(primaryLabelSprite);
+    }
 
     if (labelSecondary.trim()) {
       secondaryMarker = createSourceMarker(VEHICLE_FIT * 1.7, colorSecondary);
@@ -742,9 +759,11 @@
     if (!sourceGroup || !vehicleGroup) {
       return;
     }
+    // sourceGroup only exists in comparison mode, so reaching here means the
+    // model stands for a named source.
     // With the overlay on, the model carries a source's name, so it must not be
     // left parked at a stale position when that source stops reporting.
-    const hasPrimary = pose !== null;
+    const hasPrimary = pose !== null && primaryLabel.trim().length > 0;
     vehicleGroup.visible = hasPrimary;
     if (primaryHalo) {
       primaryHalo.visible = hasPrimary;
@@ -933,15 +952,23 @@
   </button>
   {#if showSources}
     <div class="source-legend">
-      <div class="source-row">
-        <span class="swatch" style={`background:${primaryColor};`}></span>
-        <span class="source-name">{primaryLabel}</span>
-        <strong>
-          {pose
-            ? `${pose.xM.toFixed(2)}, ${pose.yM.toFixed(2)}, ${pose.altM.toFixed(2)} m`
-            : 'no pose'}
-        </strong>
-      </div>
+      {#if !primaryLabel && !secondaryLabel}
+        <div class="source-row">
+          <span class="swatch spacer"></span>
+          <span class="source-name">No source shown</span>
+        </div>
+      {/if}
+      {#if primaryLabel}
+        <div class="source-row">
+          <span class="swatch" style={`background:${primaryColor};`}></span>
+          <span class="source-name">{primaryLabel}</span>
+          <strong>
+            {pose
+              ? `${pose.xM.toFixed(2)}, ${pose.yM.toFixed(2)}, ${pose.altM.toFixed(2)} m`
+              : 'no pose'}
+          </strong>
+        </div>
+      {/if}
       {#if secondaryLabel}
         <div class="source-row">
           <span class="swatch outline" style={`border-color:${secondaryColor};`}></span>
