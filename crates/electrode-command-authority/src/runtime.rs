@@ -110,13 +110,54 @@ impl CommandAuthorityConfig {
     }
 }
 
+/// The LAN motion-capture link: an isolated client session to the machine that
+/// publishes mocap, plus the schema-verified relays fed from it.
+///
+/// Held apart from the other sessions, and behind its own lock, so the
+/// operator can repoint it at a different capture machine without restarting
+/// the ground station — and so its state can be reported back to them.
+#[derive(Default)]
+struct MocapLink {
+    endpoint: Option<String>,
+    session: Option<Session>,
+    subscribers: Vec<zenoh::pubsub::Subscriber<()>>,
+    error: Option<String>,
+}
+
+impl MocapLink {
+    /// Drop the relays before the session: a relay outliving its session would
+    /// keep republishing from a link the operator believes is closed.
+    fn tear_down(&mut self) {
+        self.subscribers.clear();
+        if let Some(session) = self.session.take() {
+            let _ = session.close().wait();
+        }
+    }
+}
+
+/// What the mocap link is doing, for the operator-facing status view.
+#[derive(Clone, Debug, Default)]
+pub struct MocapLinkStatus {
+    /// Configured Zenoh locator, or `None` when no capture machine is set.
+    pub endpoint: Option<String>,
+    /// A session is open *and* has at least one peer or router on the far end.
+    /// A capture machine that goes away after the link was opened leaves the
+    /// session alive with nothing behind it, so peer count — not the session
+    /// existing — is the honest answer to "is the capture machine there".
+    pub connected: bool,
+    /// Peers and routers visible on the link.
+    pub peers: usize,
+    /// Why the last attempt to open the link failed, if it did.
+    pub error: Option<String>,
+}
+
 /// Owns both isolated sessions and all allowlisted relays.
 pub struct CommandAuthority {
     browser_router: Session,
     browser_session: Session,
     lan_request_router: Session,
     lan_request_session: Session,
-    telemetry_session: Option<Session>,
+    mocap: Mutex<MocapLink>,
     vehicle_router: Session,
     vehicle_session: Session,
     subscribers: Vec<zenoh::pubsub::Subscriber<()>>,
@@ -144,10 +185,6 @@ impl CommandAuthority {
         let browser_session = open_session("client", "", Some(&config.browser_listen))?;
         let lan_request_router = open_session("router", &config.lan_request_listen, None)?;
         let lan_request_session = open_session("client", "", Some(&config.lan_request_listen))?;
-        let telemetry_session = match config.telemetry_connect.as_deref() {
-            Some(endpoint) => Some(open_session("client", "", Some(endpoint))?),
-            None => None,
-        };
         let vehicle_router = open_session("router", &config.vehicle_listen, None)?;
         let vehicle_session = open_session("client", "", Some(&config.vehicle_listen))?;
         let policy = Arc::new(CommandPolicy::new(config.policy.clone()));
@@ -187,7 +224,7 @@ impl CommandAuthority {
             })
             .map_err(|error| anyhow!("start command query worker: {error}"))?;
 
-        let mut subscribers = vec![
+        let subscribers = vec![
             subscribe_intents(
                 &browser_session,
                 &vehicle_session,
@@ -212,22 +249,6 @@ impl CommandAuthority {
             relay_to_browser(&vehicle_session, &browser_session, PRIVATE_PWM_TOPIC)?,
             relay_verified_mocap(&browser_session, &vehicle_session)?,
         ];
-        if let Some(telemetry) = telemetry_session.as_ref() {
-            subscribers.push(relay_verified_lan_mocap(
-                telemetry,
-                &vehicle_session,
-                &browser_session,
-            )?);
-            subscribers.push(relay_verified_rigid_body_names(
-                telemetry,
-                &browser_session,
-            )?);
-            subscribers.push(relay_verified_raw_pose(
-                telemetry,
-                &vehicle_session,
-                &browser_session,
-            )?);
-        }
         let listeners = [
             config.vehicle_listen.clone(),
             config.browser_listen.clone(),
@@ -245,12 +266,12 @@ impl CommandAuthority {
             intents = %config.policy.intent_prefix,
             "isolated command authority listening"
         );
-        Ok(Self {
+        let authority = Self {
             browser_router,
             browser_session,
             lan_request_router,
             lan_request_session,
-            telemetry_session,
+            mocap: Mutex::new(MocapLink::default()),
             vehicle_router,
             vehicle_session,
             subscribers,
@@ -259,12 +280,81 @@ impl CommandAuthority {
             listeners,
             query_timeout: config.query_timeout,
             vehicle_endpoint: config.vehicle_listen,
-        })
+        };
+        // A capture machine that is off or unreachable must not stop the ground
+        // station from coming up: the link is reported as failed instead.
+        if let Err(error) = authority.set_mocap_endpoint(config.telemetry_connect.as_deref()) {
+            tracing::warn!(%error, "mocap link unavailable at startup");
+        }
+        Ok(authority)
     }
 
     #[must_use]
     pub fn listeners(&self) -> &[String] {
         &self.listeners
+    }
+
+    /// Point the LAN mocap link at `endpoint` (a Zenoh locator such as
+    /// `tcp/192.168.10.2:7447`), or tear it down when `None`.
+    ///
+    /// The old link is always closed first, even when the new one fails to
+    /// open: a half-applied change that leaves the previous capture machine
+    /// relaying would contradict what the operator is being shown.
+    pub fn set_mocap_endpoint(&self, endpoint: Option<&str>) -> Result<()> {
+        let mut link = self.mocap.lock().map_err(|_| anyhow!("mocap lock poisoned"))?;
+        link.tear_down();
+        link.error = None;
+        link.endpoint = endpoint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let Some(target) = link.endpoint.clone() else {
+            return Ok(());
+        };
+
+        match self.open_mocap_relays(&target) {
+            Ok((session, subscribers)) => {
+                link.session = Some(session);
+                link.subscribers = subscribers;
+                tracing::info!(endpoint = %target, "mocap link open");
+                Ok(())
+            }
+            Err(error) => {
+                link.error = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn open_mocap_relays(
+        &self,
+        endpoint: &str,
+    ) -> Result<(Session, Vec<zenoh::pubsub::Subscriber<()>>)> {
+        let session = open_session("client", "", Some(endpoint))?;
+        let subscribers = vec![
+            relay_verified_lan_mocap(&session, &self.vehicle_session, &self.browser_session)?,
+            relay_verified_rigid_body_names(&session, &self.browser_session)?,
+            relay_verified_raw_pose(&session, &self.vehicle_session, &self.browser_session)?,
+        ];
+        Ok((session, subscribers))
+    }
+
+    /// Current state of the LAN mocap link.
+    #[must_use]
+    pub fn mocap_status(&self) -> MocapLinkStatus {
+        let Ok(link) = self.mocap.lock() else {
+            return MocapLinkStatus {
+                error: Some("mocap lock poisoned".to_string()),
+                ..MocapLinkStatus::default()
+            };
+        };
+        let peers = link.session.as_ref().map_or(0, count_remote_zids);
+        MocapLinkStatus {
+            endpoint: link.endpoint.clone(),
+            connected: peers > 0,
+            peers,
+            error: link.error.clone(),
+        }
     }
 
     /// Open an isolated vehicle-side client for an in-process ground-station
@@ -333,8 +423,8 @@ impl Drop for CommandAuthority {
         let _ = self.browser_router.close().wait();
         let _ = self.lan_request_session.close().wait();
         let _ = self.lan_request_router.close().wait();
-        if let Some(session) = self.telemetry_session.take() {
-            let _ = session.close().wait();
+        if let Ok(mut link) = self.mocap.lock() {
+            link.tear_down();
         }
         let _ = self.vehicle_session.close().wait();
         let _ = self.vehicle_router.close().wait();
@@ -1002,6 +1092,19 @@ fn publish_velocity_payload(
 
 fn status_prefix(intent_prefix: &str) -> &str {
     intent_prefix.strip_suffix("/cmd").unwrap_or(intent_prefix)
+}
+
+/// Peers plus routers reachable on a session.
+///
+/// Opening the link fails outright when the capture machine is unreachable at
+/// the time, but one that goes away afterwards leaves the session open with
+/// nothing behind it. Counting the far side is what distinguishes a link that
+/// is merely configured from one that is carrying data.
+fn count_remote_zids(session: &Session) -> usize {
+    let info = session.info();
+    let peers = info.peers_zid().wait().count();
+    let routers = info.routers_zid().wait().count();
+    peers + routers
 }
 
 fn open_session(mode: &str, listen: &str, connect: Option<&str>) -> Result<Session> {

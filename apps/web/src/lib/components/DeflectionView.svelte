@@ -4,12 +4,23 @@
   import * as three from 'three';
   import type { Group, OrthographicCamera, Scene, WebGLRenderer } from 'three';
   import { loadVehicleRig, VEHICLE_LABELS, type VehicleKind, type VehicleRig } from '$lib/vehicle/vehicleRig';
+  import { createSourceMarker, type SourceMarker } from '$lib/vehicle/sourceMarker';
 
   export let attitude: Attitude | null = null;
   export let controls: ControlInputs | null = null;
   export let motors: number[] | null = null;
   export let theme: 'light' | 'dark' = 'dark';
   export let vehicleType: VehicleKind = 'fixedwing';
+  /**
+   * Attitude from the source that is *not* driving the model, drawn as a wire
+   * outline over the same two views so the two can be compared without
+   * switching between them. Naming the sources turns the comparison on.
+   */
+  export let secondaryAttitude: Attitude | null = null;
+  export let primaryLabel = '';
+  export let secondaryLabel = '';
+  export let primaryColor = '#fd7719';
+  export let secondaryColor = '#35d0ff';
 
   const FIT = 3.0;
   const FRUSTUM_HALF = 2.3;
@@ -21,6 +32,9 @@
   let topCamera: OrthographicCamera | null = null;
   let rearCamera: OrthographicCamera | null = null;
   let bodyPivot: Group | null = null;
+  let ghostPivot: Group | null = null;
+  let ghostMarker: SourceMarker | null = null;
+  let ghostSignature = '';
   let rig: VehicleRig | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let animationFrame = 0;
@@ -36,11 +50,13 @@
   $: elevator = controls?.elevator ?? 0;
   $: rudder = controls?.rudder ?? 0;
   $: throttle = controls?.throttle ?? 0;
+  $: showSources = primaryLabel.trim().length > 0;
 
   $: if (mounted && scene) {
     void loadVehicle(vehicleType);
   }
   $: applyBackground(theme);
+  $: updateGhost(secondaryLabel, secondaryColor);
 
   const vehicleKinds: VehicleKind[] = ['quadrotor', 'fixedwing'];
 
@@ -100,6 +116,39 @@
     bodyPivot = new three.Group();
     bodyPivot.rotation.order = 'YXZ';
     scene.add(bodyPivot);
+
+    ghostPivot = new three.Group();
+    ghostPivot.rotation.order = 'YXZ';
+    ghostPivot.visible = false;
+    scene.add(ghostPivot);
+    updateGhost(secondaryLabel, secondaryColor);
+  }
+
+  /**
+   * The second source is a wire outline slightly larger than the model, so it
+   * stays readable when the two agree and reads as a divergence when they
+   * don't.
+   */
+  function updateGhost(label: string, color: string): void {
+    if (!ghostPivot) {
+      return;
+    }
+    const signature = `${label}|${color}`;
+    if (signature === ghostSignature) {
+      return;
+    }
+    ghostSignature = signature;
+
+    if (ghostMarker) {
+      ghostPivot.remove(ghostMarker.root);
+      ghostMarker.dispose();
+      ghostMarker = null;
+    }
+    if (!label.trim()) {
+      return;
+    }
+    ghostMarker = createSourceMarker(FIT * 1.08, color);
+    ghostPivot.add(ghostMarker.root);
   }
 
   async function loadVehicle(kind: VehicleKind): Promise<void> {
@@ -170,11 +219,23 @@
       return;
     }
 
+    // With two sources named, the model stands for the primary one: a level
+    // model under its label would read as "this source says level" when the
+    // truth is that it says nothing.
+    bodyPivot.visible = !showSources || attitude !== null;
     bodyPivot.rotation.set(
       three.MathUtils.degToRad(pitchDeg),
       -three.MathUtils.degToRad(yawDeg),
       -three.MathUtils.degToRad(rollDeg)
     );
+    if (ghostPivot) {
+      ghostPivot.visible = ghostMarker !== null && secondaryAttitude !== null;
+      ghostPivot.rotation.set(
+        three.MathUtils.degToRad(secondaryAttitude?.pitchDeg ?? 0),
+        -three.MathUtils.degToRad(secondaryAttitude?.yawDeg ?? 0),
+        -three.MathUtils.degToRad(secondaryAttitude?.rollDeg ?? 0)
+      );
+    }
     if (ready && rig) {
       rig.update(controls, motors);
     }
@@ -205,12 +266,16 @@
     cancelAnimationFrame(animationFrame);
     resizeObserver?.disconnect();
     rig?.dispose();
+    ghostMarker?.dispose();
     renderer?.dispose();
     renderer = null;
     scene = null;
     topCamera = null;
     rearCamera = null;
     bodyPivot = null;
+    ghostPivot = null;
+    ghostMarker = null;
+    ghostSignature = '';
     rig = null;
     resizeObserver = null;
   }
@@ -241,11 +306,31 @@
       {/each}
     </div>
 
-    <div class="attitude-readout">
-      <div><span>Roll</span><strong>{rollDeg.toFixed(0)}°</strong></div>
-      <div><span>Pitch</span><strong>{pitchDeg.toFixed(0)}°</strong></div>
-      <div><span>Yaw</span><strong>{yawDeg.toFixed(0)}°</strong></div>
-    </div>
+    {#if showSources}
+      <div class="attitude-sources">
+        <div class="attitude-source">
+          <span class="swatch" style={`background:${primaryColor};`}></span>
+          <span class="source-name">{primaryLabel}</span>
+          <strong>{attitude ? `${rollDeg.toFixed(0)}° ${pitchDeg.toFixed(0)}° ${yawDeg.toFixed(0)}°` : 'no data'}</strong>
+        </div>
+        <div class="attitude-source">
+          <span class="swatch outline" style={`border-color:${secondaryColor};`}></span>
+          <span class="source-name">{secondaryLabel}</span>
+          <strong>
+            {secondaryAttitude
+              ? `${secondaryAttitude.rollDeg.toFixed(0)}° ${secondaryAttitude.pitchDeg.toFixed(0)}° ${secondaryAttitude.yawDeg.toFixed(0)}°`
+              : 'no data'}
+          </strong>
+        </div>
+        <div class="attitude-source axes"><span class="swatch spacer"></span><span class="source-name"></span><strong>roll · pitch · yaw</strong></div>
+      </div>
+    {:else}
+      <div class="attitude-readout">
+        <div><span>Roll</span><strong>{rollDeg.toFixed(0)}°</strong></div>
+        <div><span>Pitch</span><strong>{pitchDeg.toFixed(0)}°</strong></div>
+        <div><span>Yaw</span><strong>{yawDeg.toFixed(0)}°</strong></div>
+      </div>
+    {/if}
 
     {#if loadError}
       <div class="view-status error">{loadError}</div>
@@ -412,6 +497,78 @@
     color: #edf6f1;
     font-size: 0.82rem;
     font-weight: 760;
+  }
+
+  .attitude-sources {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    display: grid;
+    gap: 3px;
+    padding: 7px 9px;
+    border: 1px solid rgba(253, 119, 25, 0.2);
+    border-radius: 8px;
+    background: rgba(5, 8, 8, 0.74);
+    backdrop-filter: blur(5px);
+    pointer-events: none;
+  }
+
+  .attitude-source {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .attitude-source .swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    flex: none;
+  }
+
+  .attitude-source .swatch.outline {
+    background: transparent;
+    border: 2px solid;
+    border-radius: 50%;
+  }
+
+  .attitude-source .swatch.spacer {
+    background: transparent;
+  }
+
+  .attitude-source .source-name {
+    min-width: 62px;
+    color: #91a39c;
+    font-size: 0.58rem;
+    font-weight: 760;
+    text-transform: uppercase;
+  }
+
+  .attitude-source strong {
+    color: #edf6f1;
+    font-size: 0.72rem;
+    font-weight: 760;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .attitude-source.axes strong {
+    color: #91a39c;
+    font-size: 0.55rem;
+    text-transform: uppercase;
+  }
+
+  .deflection-view.light .attitude-sources {
+    border-color: rgba(227, 95, 12, 0.28);
+    background: rgba(255, 255, 255, 0.85);
+  }
+
+  .deflection-view.light .attitude-source .source-name,
+  .deflection-view.light .attitude-source.axes strong {
+    color: #5c6873;
+  }
+
+  .deflection-view.light .attitude-source strong {
+    color: #12171b;
   }
 
   .view-status {

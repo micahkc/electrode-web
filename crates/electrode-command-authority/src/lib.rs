@@ -16,4 +16,4 @@ pub use policy::{
     AuthorizedCommand, CommandPolicy, Delivery, PolicyConfig, PolicyError,
     CANONICAL_FIRMWARE_QUERY_KEYS,
 };
-pub use runtime::{CommandAuthority, CommandAuthorityConfig};
+pub use runtime::{CommandAuthority, CommandAuthorityConfig, MocapLinkStatus};

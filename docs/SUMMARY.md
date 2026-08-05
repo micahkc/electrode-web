@@ -9,5 +9,6 @@
 - [Message Lifecycle](message_lifecycle.md)
 - [Topic Conventions](topic_conventions.md)
 - [Manual Control](manual_control.md)
+- [Telemetry Link](telemetry_link.md)
 - [Safety Model](safety_model.md)
 - [Roadmap](roadmap.md)

@@ -34,6 +34,11 @@ describe('Synapse decoder', () => {
 
   it('classifies known topic keys', () => {
     expect(classify('robot/manual')).toBe('ManualControl');
+    // The telemetry bridge publishes multi-instance topics with the producer
+    // instance in the key, so both forms must resolve.
+    expect(classify('gnss')).toBe('GnssFix');
+    expect(classify('gnss/0')).toBe('GnssFix');
+    expect(classify('cub1/gnss/1')).toBe('GnssFix');
     expect(classify('synapse/mocap/rigid_body/cub1/pose')).toBe('MocapFrame');
     expect(classify('synapse/mocap/frame')).toBe('MocapFrame');
     expect(classify('synapse/v1/topic/mocap_frame')).toBe('MocapFrame');
@@ -243,5 +248,220 @@ describe('Mocap wire contract', () => {
     expect(decoded.decoded).toBe(true);
     expect(decoded.schema).toBe('MocapFrame');
     expect(decoded.payload).toMatchObject({ frame_number: 7, timestamp_us: 99 });
+  });
+});
+
+/** Field offsets are the vehicle's own struct layout, padding included. */
+function encodeGnssFix(fields: Record<string, number> = {}): Uint8Array {
+  const bytes = new Uint8Array(64);
+  const view = new DataView(bytes.buffer);
+  view.setBigUint64(0, BigInt(fields.timestampUs ?? 0), true);
+  view.setBigUint64(8, BigInt(fields.timeUnixUs ?? 0), true);
+  view.setInt32(16, fields.latitudeDegE7 ?? 0, true);
+  view.setInt32(20, fields.longitudeDegE7 ?? 0, true);
+  view.setInt32(24, fields.altitudeMslMm ?? 0, true);
+  view.setInt32(28, fields.altitudeEllipsoidMm ?? 0, true);
+  // The onboard NMEA path saturates all three accuracies; default to that.
+  view.setUint16(32, fields.horizontalAccuracyMm ?? 0xffff, true);
+  view.setUint16(34, fields.verticalAccuracyMm ?? 0xffff, true);
+  view.setUint16(36, fields.velocityAccuracyMmS ?? 0xffff, true);
+  view.setUint16(38, fields.yawAccuracyCdeg ?? 0, true);
+  view.setUint16(40, fields.hdopCenti ?? 0, true);
+  view.setUint16(42, fields.vdopCenti ?? 0, true);
+  view.setUint16(44, fields.groundSpeedCmS ?? 0, true);
+  view.setUint16(46, fields.courseOverGroundCdeg ?? 0, true);
+  view.setUint16(48, fields.yawCdeg ?? 0, true);
+  view.setInt16(50, fields.velocityUpCmS ?? 0, true);
+  view.setUint8(52, fields.flags ?? 0);
+  view.setUint8(53, fields.fixType ?? 0);
+  view.setUint8(54, fields.satellitesUsed ?? 0);
+  view.setUint8(55, fields.satellitesVisible ?? 0);
+  view.setUint8(56, fields.id ?? 0);
+  return bytes;
+}
+
+function decodeGnss(fields: Record<string, number> = {}): Record<string, unknown> {
+  const topic = parseKey('gnss')!.topic;
+  const decoded = decode('gnss', encodeGnssFix(fields), expectedTopicEncoding(topic));
+  expect(decoded.schema).toBe('GnssFix');
+  expect(decoded.decoded).toBe(true);
+  return (decoded.payload as { data: Record<string, unknown> }).data;
+}
+
+describe('GnssFix decoder', () => {
+  it('decodes a 3D fix', () => {
+    const data = decodeGnss({
+      latitudeDegE7: 377_749_000,
+      longitudeDegE7: -1_224_194_000,
+      altitudeMslMm: 12_000,
+      fixType: 3,
+      satellitesUsed: 11,
+      satellitesVisible: 14,
+      groundSpeedCmS: 350,
+      hdopCenti: 90,
+      horizontalAccuracyMm: 1500
+    });
+
+    expect(data).toMatchObject({
+      position_valid: true,
+      fix_type_name: '3D',
+      latitude_deg: 37.7749,
+      longitude_deg: -122.4194,
+      altitude_msl_m: 12,
+      ground_speed_mps: 3.5,
+      satellites_used: 11,
+      satellites_visible: 14,
+      hdop: 0.9,
+      horizontal_accuracy_m: 1.5
+    });
+  });
+
+  // The vehicle publishes samples while the receiver has no lock, and those
+  // carry a zeroed latitude/longitude that would plot off West Africa.
+  it.each([
+    ['NoFix', 0],
+    ['TimeOnly', 1]
+  ])('reports no position for a %s sample', (_name, fixType) => {
+    const data = decodeGnss({ fixType, latitudeDegE7: 0, longitudeDegE7: 0 });
+
+    expect(data.position_valid).toBe(false);
+    expect(data.latitude_deg).toBeNull();
+    expect(data.longitude_deg).toBeNull();
+    expect(data.altitude_msl_m).toBeNull();
+  });
+
+  it('treats a saturated accuracy as unusable rather than as 65.5 m', () => {
+    const data = decodeGnss({ fixType: 3 });
+
+    expect(data.horizontal_accuracy_m).toBeNull();
+    expect(data.vertical_accuracy_m).toBeNull();
+    expect(data.velocity_accuracy_mps).toBeNull();
+  });
+
+  it('reports unpopulated optional fields as missing, not as zero', () => {
+    const data = decodeGnss({ fixType: 3, satellitesUsed: 11 });
+
+    // No validity flags set, so none of these were measured.
+    expect(data.course_over_ground_deg).toBeNull();
+    expect(data.yaw_deg).toBeNull();
+    expect(data.velocity_up_mps).toBeNull();
+    expect(data.time_unix_us).toBeNull();
+    // Left at 0 rather than saturated, so it must not read as a perfect fix.
+    expect(data.yaw_accuracy_deg).toBeNull();
+    expect(data.vdop).toBeNull();
+    // Cannot see fewer satellites than it is using: the field is unpopulated.
+    expect(data.satellites_visible).toBeNull();
+  });
+
+  it('honours the validity flags when the fields are populated', () => {
+    const data = decodeGnss({
+      fixType: 3,
+      flags: 1 | 2 | 8, // TimeValid | CourseValid | VelocityUpValid
+      timeUnixUs: 1_700_000_000_000_000,
+      courseOverGroundCdeg: 9_000,
+      velocityUpCmS: -25
+    });
+
+    expect(data.time_unix_us).toBe(1_700_000_000_000_000);
+    expect(data.course_over_ground_deg).toBe(90);
+    expect(data.velocity_up_mps).toBe(-0.25);
+    // YawValid is still clear.
+    expect(data.yaw_deg).toBeNull();
+  });
+});
+
+const SENSOR_GYRO = 1;
+const SENSOR_ACCEL = 2;
+const SENSOR_RC = 512;
+const SENSOR_MOTORS = 1024;
+const SENSOR_BATTERY = 2048;
+const SENSOR_ESTIMATOR = 4096;
+
+function encodeVehicleHealth(fields: Record<string, number> = {}): Uint8Array {
+  const bytes = new Uint8Array(48);
+  const view = new DataView(bytes.buffer);
+  view.setBigUint64(0, BigInt(fields.timestampUs ?? 0), true);
+  view.setUint32(8, fields.sensorsPresent ?? 0, true);
+  view.setUint32(12, fields.sensorsEnabled ?? 0, true);
+  view.setUint32(16, fields.sensorsHealth ?? 0, true);
+  view.setUint16(32, fields.loadDpermille ?? 0, true);
+  view.setUint16(34, fields.voltageBatteryCv ?? 0, true);
+  view.setInt16(36, fields.currentBatteryDa ?? 0, true);
+  view.setInt8(42, fields.batteryRemainingPct ?? 0);
+  view.setUint8(44, fields.flightMode ?? 0);
+  view.setUint8(45, fields.systemState ?? 0);
+  view.setUint8(46, fields.linkQualityPct ?? 0);
+  view.setUint8(47, fields.flags ?? 0);
+  return bytes;
+}
+
+function decodeHealth(fields: Record<string, number> = {}): Record<string, unknown> {
+  const topic = parseKey('health')!.topic;
+  const decoded = decode('health', encodeVehicleHealth(fields), expectedTopicEncoding(topic));
+  expect(decoded.decoded).toBe(true);
+  return (decoded.payload as { data: Record<string, unknown> }).data;
+}
+
+describe('VehicleHealth decoder', () => {
+  // A vehicle with no battery monitor leaves these at zero, which would
+  // otherwise render as a flat pack rather than as an absent one.
+  it('reports no battery when the vehicle has no battery component', () => {
+    const data = decodeHealth({
+      sensorsPresent: SENSOR_GYRO | SENSOR_ACCEL | SENSOR_MOTORS,
+      sensorsEnabled: SENSOR_GYRO | SENSOR_ACCEL | SENSOR_MOTORS,
+      sensorsHealth: SENSOR_GYRO | SENSOR_ACCEL | SENSOR_MOTORS
+    });
+
+    expect(data.battery_present).toBe(false);
+    expect(data.voltage_battery_v).toBeNull();
+    expect(data.current_battery_a).toBeNull();
+    expect(data.battery_remaining_pct).toBeNull();
+    expect(data.load_pct).toBeNull();
+  });
+
+  it('decodes battery telemetry when the component is present', () => {
+    const data = decodeHealth({
+      sensorsPresent: SENSOR_BATTERY,
+      voltageBatteryCv: 1_650,
+      currentBatteryDa: 82,
+      batteryRemainingPct: 74
+    });
+
+    expect(data).toMatchObject({
+      battery_present: true,
+      voltage_battery_v: 16.5,
+      current_battery_a: 8.2,
+      battery_remaining_pct: 74
+    });
+  });
+
+  // The sensor bitmask is the authoritative failsafe indicator: RDD2 raises
+  // Armed but never the Failsafe flag itself.
+  it('raises failsafe when an enabled component drops out of health', () => {
+    const enabled = SENSOR_GYRO | SENSOR_ACCEL | SENSOR_RC | SENSOR_MOTORS | SENSOR_ESTIMATOR;
+    const data = decodeHealth({
+      sensorsPresent: enabled,
+      sensorsEnabled: enabled,
+      sensorsHealth: enabled & ~SENSOR_RC,
+      flags: 1 // Armed, and deliberately not Failsafe
+    });
+
+    expect(data.armed).toBe(true);
+    expect(data.failsafe_flag).toBe(false);
+    expect(data.failsafe).toBe(true);
+    expect(data.unhealthy_sensors).toEqual(['rc']);
+  });
+
+  it('stays clear of failsafe while every enabled component is healthy', () => {
+    const enabled = SENSOR_GYRO | SENSOR_ACCEL | SENSOR_MOTORS | SENSOR_ESTIMATOR;
+    const data = decodeHealth({
+      sensorsPresent: enabled,
+      sensorsEnabled: enabled,
+      sensorsHealth: enabled,
+      flags: 1
+    });
+
+    expect(data.failsafe).toBe(false);
+    expect(data.unhealthy_sensors).toEqual([]);
   });
 });

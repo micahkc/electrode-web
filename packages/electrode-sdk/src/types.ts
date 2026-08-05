@@ -39,6 +39,31 @@ export interface Pose {
   zM: number;
 }
 
+/**
+ * Decoded GNSS fix. Anything a receiver may leave unpopulated is `null` rather
+ * than zero, so the UI can render "not reported" instead of a plausible-looking
+ * measurement. In particular there is no position-valid flag on the wire: the
+ * vehicle publishes fixes while still acquiring, so `positionValid` is derived
+ * from the fix type and gates `lat`/`lon`/`altMslM`.
+ */
+export interface GnssState {
+  fixType: number;
+  fixTypeName: string;
+  positionValid: boolean;
+  lat: number | null;
+  lon: number | null;
+  altMslM: number | null;
+  /** 1-sigma; null when the receiver reports no accuracy estimate. */
+  horizontalAccuracyM: number | null;
+  verticalAccuracyM: number | null;
+  groundSpeedMps: number;
+  courseOverGroundDeg: number | null;
+  satellitesUsed: number;
+  satellitesVisible: number | null;
+  hdop: number | null;
+  updatedAtMs: number;
+}
+
 export interface Velocity {
   northMps: number;
   eastMps: number;
@@ -196,11 +221,21 @@ export interface VehicleState {
    * ground truth for the displayed vehicle pose.
    */
   attitudeEstimate: Attitude | null;
+  /**
+   * Last pose and attitude a mocap system reported, kept apart from the
+   * canonical `pose`/`attitude` so both sources can be drawn together. Whether
+   * they are still current is `localization.fresh`/`updatedAtMs`, not their
+   * presence: the last known mocap pose stays here after tracking is lost.
+   */
+  mocapPose: Pose | null;
+  mocapAttitude: Attitude | null;
   controls: ControlInputs | null;
   manualControl: ManualControlState | null;
   radioControl: number[] | null;
   motors: number[] | null;
   battery: Battery | null;
+  /** Last GNSS fix, present only when the vehicle telemeters one. */
+  gnss: GnssState | null;
   link: LinkStatus | null;
   mode: ModeState;
   localization: LocalizationState;

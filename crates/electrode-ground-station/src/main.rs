@@ -15,9 +15,11 @@ mod autopilot_link;
 mod devices;
 mod joystick;
 mod mapping;
+mod mocap;
 mod sim_bridge;
 mod simulation;
 mod supervisor;
+mod telemetry;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,6 +45,7 @@ use tower::{service_fn, ServiceExt};
 use autopilot::AutopilotProfile;
 use autopilot_link::{AutopilotLink, AutopilotRunStatus};
 use mapping::MappingProfile;
+use mocap::MocapProfile;
 use simulation::{ModelicaFile, ModelicaFileSave, SimulationProfile};
 use supervisor::Supervisor;
 
@@ -83,6 +86,14 @@ struct Cli {
         default_value = "electrode-simulation.json"
     )]
     simulation_file: PathBuf,
+
+    /// Where the motion-capture link profile is stored.
+    #[arg(
+        long,
+        env = "ELECTRODE_GCS_MOCAP_FILE",
+        default_value = "electrode-mocap.json"
+    )]
+    mocap_file: PathBuf,
 }
 
 struct AppState {
@@ -95,8 +106,12 @@ struct AppState {
     sim_bridge: sim_bridge::SimBridge,
     supervisor: Supervisor,
     ppm_supervisor: Supervisor,
+    telemetry: RwLock<telemetry::TelemetryProfile>,
+    telemetry_supervisor: Supervisor,
+    mocap: RwLock<MocapProfile>,
+    mocap_file: PathBuf,
     autopilot_link: AutopilotLink,
-    _command_authority: CommandAuthority,
+    command_authority: CommandAuthority,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,7 +176,7 @@ async fn runtime_parameter(
             ("cmd/param_get", false)
         };
         let payload = state
-            ._command_authority
+            .command_authority
             .trusted_query(target, builder.finished_data().to_vec())?;
         let value = if expected_set {
             let reply = flatbuffers::root::<ParamSetReply<'_>>(&payload)?;
@@ -190,7 +205,7 @@ async fn runtime_parameter(
             );
             readback_builder.finish(readback_root, None);
             let readback_payload = state
-                ._command_authority
+                .command_authority
                 .trusted_query("cmd/param_get", readback_builder.finished_data().to_vec())?;
             let readback = flatbuffers::root::<ParamGetReply<'_>>(&readback_payload)?;
             anyhow::ensure!(
@@ -349,7 +364,7 @@ async fn autopilot_start(
         .clone();
     // The link blocks briefly on zenoh open; keep the async runtime free.
     let link = tokio::task::block_in_place(|| {
-        let session = state._command_authority.vehicle_client()?;
+        let session = state.command_authority.vehicle_client()?;
         state.autopilot_link.start(&profile, Some(session))
     });
     link.map(Json)
@@ -494,6 +509,162 @@ async fn ppm_bridge_stop(State(state): State<Shared>) -> Json<BridgeStatus> {
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TelemetryStatus {
+    running: bool,
+    bin: String,
+    profile: telemetry::TelemetryProfile,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MocapStatus {
+    /// As stored, in whatever form the operator typed it.
+    address: String,
+    /// The Zenoh locator that address resolves to, so the operator can see
+    /// what the default transport and port filled in.
+    endpoint: Option<String>,
+    /// Something answered on the far end. A configured address with
+    /// `connected: false` is an address nothing is listening at.
+    connected: bool,
+    peers: usize,
+    error: Option<String>,
+}
+
+fn mocap_status_of(state: &Shared) -> MocapStatus {
+    let address = state
+        .mocap
+        .read()
+        .expect("mocap lock poisoned")
+        .address
+        .clone();
+    let link = state.command_authority.mocap_status();
+    MocapStatus {
+        address,
+        endpoint: link.endpoint,
+        connected: link.connected,
+        peers: link.peers,
+        error: link.error,
+    }
+}
+
+async fn mocap_status(State(state): State<Shared>) -> Json<MocapStatus> {
+    Json(mocap_status_of(&state))
+}
+
+/// Repoint the mocap link at a different capture machine.
+///
+/// The link is reopened in place; the address is persisted only once the link
+/// has been applied, so a stored address always names the machine the ground
+/// station is actually subscribed to. An unreachable address is not an error —
+/// the capture system is routinely powered on after the ground station — so it
+/// is stored and reported as configured-but-not-connected.
+async fn put_mocap(
+    State(state): State<Shared>,
+    Json(profile): Json<MocapProfile>,
+) -> Result<Json<MocapStatus>, (StatusCode, String)> {
+    let address = profile.address.trim().to_string();
+    if address.len() > 256 {
+        return Err((StatusCode::BAD_REQUEST, "address too long".into()));
+    }
+    let profile = MocapProfile { address };
+    let endpoint = profile.endpoint();
+    if let Err(error) = state
+        .command_authority
+        .set_mocap_endpoint(endpoint.as_deref())
+    {
+        tracing::warn!(%error, "mocap link could not be opened");
+    }
+    {
+        let mut current = state.mocap.write().expect("mocap lock poisoned");
+        *current = profile;
+        if let Err(error) = current.save(&state.mocap_file) {
+            tracing::warn!(%error, "could not persist the mocap profile");
+        }
+    }
+    Ok(Json(mocap_status_of(&state)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MocapGnssRequest {
+    enabled: bool,
+}
+
+fn telemetry_status_of(state: &Shared) -> TelemetryStatus {
+    TelemetryStatus {
+        running: state.telemetry_supervisor.running(),
+        bin: state.telemetry_supervisor.bin_display(),
+        profile: state
+            .telemetry
+            .read()
+            .expect("telemetry lock poisoned")
+            .clone(),
+    }
+}
+
+async fn telemetry_status(State(state): State<Shared>) -> Json<TelemetryStatus> {
+    Json(telemetry_status_of(&state))
+}
+
+/// Replace the telemetry profile. A running bridge is relaunched so a device
+/// or baud change takes effect without the operator restarting the daemon.
+async fn put_telemetry(
+    State(state): State<Shared>,
+    Json(profile): Json<telemetry::TelemetryProfile>,
+) -> Result<Json<TelemetryStatus>, (StatusCode, String)> {
+    let args = {
+        let mut current = state.telemetry.write().expect("telemetry lock poisoned");
+        *current = profile;
+        current.bridge_args()
+    };
+    state
+        .telemetry_supervisor
+        .restart_if_running(&args)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(telemetry_status_of(&state)))
+}
+
+async fn telemetry_start(
+    State(state): State<Shared>,
+) -> Result<Json<TelemetryStatus>, (StatusCode, String)> {
+    let args = state
+        .telemetry
+        .read()
+        .expect("telemetry lock poisoned")
+        .bridge_args();
+    state
+        .telemetry_supervisor
+        .start(&args)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(telemetry_status_of(&state)))
+}
+
+async fn telemetry_stop(State(state): State<Shared>) -> Json<TelemetryStatus> {
+    state.telemetry_supervisor.stop();
+    Json(telemetry_status_of(&state))
+}
+
+/// Toggle the mocap GNSS uplink. The radio's serial port cannot be shared, so
+/// the setting lives on the one bridge process and takes effect by relaunching
+/// it — telemetry drops for the moment that takes.
+async fn telemetry_set_mocap_gnss(
+    State(state): State<Shared>,
+    Json(request): Json<MocapGnssRequest>,
+) -> Result<Json<TelemetryStatus>, (StatusCode, String)> {
+    let args = {
+        let mut profile = state.telemetry.write().expect("telemetry lock poisoned");
+        profile.mocap_gnss = request.enabled;
+        profile.bridge_args()
+    };
+    state
+        .telemetry_supervisor
+        .restart_if_running(&args)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(telemetry_status_of(&state)))
+}
+
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .ok()
@@ -512,7 +683,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let command_authority = CommandAuthority::start(CommandAuthorityConfig::from_env())?;
+    // The stored capture-machine address wins over the launch environment:
+    // it is what the operator last set from the UI, and the env var is only
+    // the seed for a machine that has never had one set.
+    let mut mocap_profile = MocapProfile::load_or_default(&cli.mocap_file);
+    let mut authority_config = CommandAuthorityConfig::from_env();
+    match mocap_profile.endpoint() {
+        Some(endpoint) => authority_config.telemetry_connect = Some(endpoint),
+        // Nothing stored, but the environment named a capture machine. Show
+        // that as the address rather than leaving the field blank next to a
+        // live link — an operator reading "not configured" while mocap streams
+        // has no way to tell which of the two is lying.
+        None => {
+            if let Some(seed) = authority_config.telemetry_connect.clone() {
+                mocap_profile.address = seed;
+            }
+        }
+    }
+    let command_authority = CommandAuthority::start(authority_config)?;
     let zenoh_listeners = command_authority.listeners().to_vec();
     let autopilot_profile = AutopilotProfile::load_or_default(&cli.autopilot_file);
     let sim_bridge = sim_bridge::SimBridge::start(
@@ -530,8 +718,12 @@ async fn main() -> anyhow::Result<()> {
         sim_bridge,
         supervisor: Supervisor::manual_control(),
         ppm_supervisor: Supervisor::ppm_bridge(),
+        telemetry: RwLock::new(telemetry::TelemetryProfile::default()),
+        telemetry_supervisor: Supervisor::telemetry_bridge(),
+        mocap: RwLock::new(mocap_profile),
+        mocap_file: cli.mocap_file.clone(),
         autopilot_link: AutopilotLink::new(),
-        _command_authority: command_authority,
+        command_authority,
     });
 
     // The gcs/* API is same-origin in production; permissive CORS lets the Vite
@@ -555,6 +747,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/bridge", get(bridge_status))
         .route("/bridge/start", post(bridge_start))
         .route("/bridge/stop", post(bridge_stop))
+        .route("/telemetry", get(telemetry_status).put(put_telemetry))
+        .route("/telemetry/start", post(telemetry_start))
+        .route("/telemetry/stop", post(telemetry_stop))
+        .route("/telemetry/mocap-gnss", post(telemetry_set_mocap_gnss))
+        .route("/mocap", get(mocap_status).put(put_mocap))
         .route("/ppm", get(bridge_status))
         .route("/ppm/start", post(ppm_bridge_start))
         .route("/ppm/stop", post(ppm_bridge_stop))

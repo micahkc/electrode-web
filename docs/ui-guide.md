@@ -42,6 +42,43 @@ Use the screen from top left to bottom right:
 6. Use **Plots**, **Discovery**, **Topics**, **Replay**, and **Logging** when
    debugging or recording a session.
 
+## Airframe Switch
+
+The header carries a **Plane / rdd2** switch. The two airframes ask different
+questions, so they get different dashboards rather than one crowded layout.
+
+- **Plane** is the fixed-wing layout: autopilot, State I/O, Manual Link and the
+  full topic registry.
+- **rdd2** is the quadrotor layout: the telemetry radio, GNSS, and the odometry
+  the vehicle flies on. It hides the panels that only mean something for a
+  plane.
+
+The choice sets the vehicle model used by the 3D scene and Control Surfaces,
+and is kept in the URL as `?airframe=`, so a layout can be bookmarked.
+
+### Telemetry vs mocap on rdd2
+
+The rdd2 layout has two independent answers to "where is the vehicle and how is
+it oriented": what the vehicle telemeters over the radio, and what the motion
+capture system sees. Both are drawn at once so they can be compared, in the 3D
+scene and in Control Surfaces:
+
+- The **Telemetry / Mocap** buttons in the Map toolbar pick which source drives
+  the solid vehicle model. That source is named on a coloured label above the
+  vehicle with a matching ring on the floor beneath it.
+- The other source is drawn as a **wire outline** in its own colour, with its
+  own label, floor ring and flight trail. In Control Surfaces it is the wire
+  airframe overlaid on the top and rear views.
+- Colours are fixed per source — telemetry orange, mocap cyan — so a marker's
+  identity never depends on which button is selected.
+- **Separation** in the 3D legend is the straight-line distance between the two,
+  which is the number to watch when checking whether the vehicle has converged
+  onto mocap.
+
+Neither source is ever filled in from the other. A source with no data reads
+`no pose` / `no data` and its marker is not drawn, so two markers agreeing
+always means the sources agree.
+
 ## Header
 
 The header shows the Electrode mark, the current vehicle id, and the settings
@@ -174,6 +211,64 @@ arriving, and whether it is late.
 
 In Viewer mode with no backend or Zenoh stream, this panel is expected to say
 `No topics`.
+
+## Telemetry Link
+
+**Telemetry Link** appears on the rdd2 dashboard only. It owns the radio: the
+serial device, start/stop, the **Mocap GPS** uplink toggle, the current GNSS
+fix, and which of the six telemetry topics are arriving with their rates.
+
+Prefer a `/dev/serial/by-id/` path for the device. `ttyUSB` numbering swaps
+between boots when more than one adapter is attached, and the adapter you want
+is rarely the one that enumerated first.
+
+Editing the device while the bridge runs relaunches it, because the radio's
+serial port cannot be shared and the uplink is a flag on the one process that
+owns it.
+
+See [Telemetry Link](telemetry_link.md) for the wire format and the uplink.
+
+## Mocap
+
+**Mocap** owns the link to the motion-capture machine. Mocap does not arrive
+over the telemetry radio: a capture system publishes it on its own Zenoh router
+and the ground station subscribes to that router across the network. The panel
+is on both dashboards, because both airframes fly on mocap indoors.
+
+The panel separates two things that are easy to confuse and lead to very
+different fixes:
+
+- **Link** is the network path to the capture machine. `Reachable` is the peer
+  count on that session, not whether an address was accepted — a machine that
+  is powered off, firewalled, or has dropped since the link opened reads
+  `nothing answering` even though the address is stored and valid. `Last error`
+  carries the Zenoh failure verbatim.
+- **Stream** is what is actually being captured: the pose rate, whether the
+  rigid body is tracked (`valid`), lost (`tracking lost`), or has simply gone
+  quiet (`stale`), the tracking quality, and the last pose and attitude.
+
+A healthy link with no stream means the capture machine is up but not
+publishing your rigid body. A valid stream needs no link at all when mocap is
+being produced locally.
+
+### Setting the capture machine
+
+Type the machine's address and press **Apply** (or Enter). A bare address gets
+`tcp` and port 7447, so `192.168.10.2` becomes `tcp/192.168.10.2:7447` — the
+resolved locator is shown under **Endpoint** so there is no guessing. Anything
+that already names a protocol is passed through untouched, so a full locator
+(`udp/…`, `ws/…`, a non-default port) can be pasted from a working config.
+Blank disconnects the link.
+
+The change is applied in place: the old subscription is torn down and the new
+one opened without restarting the ground station. The address is stored in
+`electrode-mocap.json` (`--mocap-file`) and takes precedence over
+`ELECTRODE_GCS_TELEMETRY_ZENOH_CONNECT` on the next start, so the environment
+variable only seeds a machine that has never had one set.
+
+An unreachable address is stored rather than rejected — the capture system is
+routinely powered on after the ground station — and reported as configured but
+not connected. Press **Apply** again once it is up.
 
 ## Control Surfaces
 

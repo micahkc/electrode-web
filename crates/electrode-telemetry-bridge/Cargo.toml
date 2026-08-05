@@ -1,0 +1,26 @@
+[package]
+name = "electrode-telemetry-bridge"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Electrode native bridge from the RDD2 CSyn serial telemetry link to Synapse topics on Zenoh"
+
+[lints]
+workspace = true
+
+[lib]
+name = "electrode_telemetry_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "electrode-telemetry-bridge"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+flatbuffers.workspace = true
+serialport.workspace = true
+synapse_fbs.workspace = true
+thiserror.workspace = true
+zenoh.workspace = true

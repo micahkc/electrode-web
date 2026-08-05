@@ -5,6 +5,13 @@
   import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
   import type { BufferGeometry, Group, Line, Material, Object3D, PerspectiveCamera, Scene, Vector3, WebGLRenderer } from 'three';
   import { loadVehicleRig, type VehicleKind, type VehicleRig } from '$lib/vehicle/vehicleRig';
+  import {
+    createSourceHalo,
+    createSourceLabel,
+    createSourceMarker,
+    disposeTree,
+    type SourceMarker
+  } from '$lib/vehicle/sourceMarker';
 
   export let pose: Pose | null = null;
   export let attitude: Attitude | null = null;
@@ -12,6 +19,21 @@
   export let motors: number[] | null = null;
   export let mission: MissionPlanState | null = null;
   export let localizationQuality = 0;
+  /**
+   * Second pose/attitude drawn alongside the vehicle as a wire marker, so
+   * telemetry and mocap can be compared in one view instead of by flipping
+   * between them. Only meaningful when both are expressed in the same frame.
+   */
+  export let secondaryPose: Pose | null = null;
+  export let secondaryAttitude: Attitude | null = null;
+  /**
+   * Naming the two sources turns the whole overlay on: an empty primary label
+   * means there is only one source and nothing to disambiguate.
+   */
+  export let primaryLabel = '';
+  export let secondaryLabel = '';
+  export let primaryColor = '#fd7719';
+  export let secondaryColor = '#35d0ff';
   export let theme: 'light' | 'dark' = 'dark';
   export let vehicleType: VehicleKind = 'fixedwing';
 
@@ -33,13 +55,31 @@
   const FOLLOW_LERP = 0.16;
   const followDelta = new three.Vector3();
 
+  /** Ring buffer behind one flown path. */
+  type Trail = { line: Line; positions: Float32Array; count: number };
+
   let followMode = false;
   let rig: VehicleRig | null = null;
   let rigLoadToken = 0;
-  let trail: Line | null = null;
-  let trailPositions: Float32Array | null = null;
-  let trailCount = 0;
+  let trail: Trail | null = null;
   let mounted = false;
+
+  // Source overlay: halo + label under the vehicle for the primary source, a
+  // wire airframe with its own halo, label and trail for the secondary, and a
+  // line between the two showing how far apart they are.
+  let sourceGroup: Group | null = null;
+  let sourceSignature = '';
+  let secondaryMarker: SourceMarker | null = null;
+  let primaryHalo: three.Mesh | null = null;
+  let secondaryHalo: three.Mesh | null = null;
+  let primaryLabelSprite: three.Sprite | null = null;
+  let secondaryLabelSprite: three.Sprite | null = null;
+  let offsetLine: Line | null = null;
+  let secondaryTrail: Trail | null = null;
+  const LABEL_LIFT_SCENE_Y = 0.08;
+  const LABEL_SCALE: [number, number] = [0.17, 0.043];
+  const HALO_RADIUS_SCENE = 0.055;
+  const FLOOR_MARK_SCENE_Y = 0.008;
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -119,9 +159,18 @@
   $: localX = pose?.xM ?? 0;
   $: localY = pose?.yM ?? 0;
   $: localAlt = pose?.altM ?? 0;
+  $: showSources = primaryLabel.trim().length > 0;
   $: updateVehicle(pose, attitude);
   $: updateMission(mission);
   $: applyTheme(theme);
+  $: updateSourceOverlay(primaryLabel, secondaryLabel, primaryColor, secondaryColor, theme);
+  $: updateSecondary(secondaryPose, secondaryAttitude);
+  // Straight-line disagreement between the two sources: the number that says
+  // whether the vehicle has actually converged onto mocap.
+  $: separationM =
+    showSources && pose && secondaryPose
+      ? Math.hypot(pose.xM - secondaryPose.xM, pose.yM - secondaryPose.yM, pose.altM - secondaryPose.altM)
+      : null;
   $: if (mounted && scene) {
     void loadVehicle(vehicleType);
   }
@@ -207,19 +256,28 @@
     vehicleGroup = createVehicleMarker();
     scene.add(vehicleGroup);
 
-    trailPositions = new Float32Array(MAX_TRAIL * 3);
-    trailCount = 0;
-    const trailGeometry = new three.BufferGeometry();
-    trailGeometry.setAttribute('position', new three.BufferAttribute(trailPositions, 3));
-    trailGeometry.setDrawRange(0, 0);
-    trail = new three.Line(
-      trailGeometry,
-      new three.LineBasicMaterial({ color: pal.xAxis, transparent: true, opacity: 0.7 })
-    );
-    scene.add(trail);
+    trail = createTrail(pal.xAxis, 0.7);
+    scene.add(trail.line);
 
     updateVehicle(pose, attitude);
     updateMission(mission);
+    // Signature starts empty, so this builds the overlay when sources are named.
+    updateSourceOverlay(primaryLabel, secondaryLabel, primaryColor, secondaryColor, theme);
+  }
+
+  function createTrail(color: three.ColorRepresentation, opacity: number): Trail {
+    const positions = new Float32Array(MAX_TRAIL * 3);
+    const geometry = new three.BufferGeometry();
+    geometry.setAttribute('position', new three.BufferAttribute(positions, 3));
+    geometry.setDrawRange(0, 0);
+    return {
+      line: new three.Line(
+        geometry,
+        new three.LineBasicMaterial({ color, transparent: true, opacity })
+      ),
+      positions,
+      count: 0
+    };
   }
 
   async function loadVehicle(kind: VehicleKind): Promise<void> {
@@ -248,16 +306,13 @@
     while (vehicleGroup.children.length > 0) {
       const child = vehicleGroup.children[0];
       vehicleGroup.remove(child);
-      disposeObject(child);
+      disposeTree(child);
     }
     rig?.dispose();
     rig = nextRig;
     vehicleGroup.add(rig.root);
     // Reset the trail so it doesn't jump across a vehicle swap.
-    trailCount = 0;
-    if (trail) {
-      trail.geometry.setDrawRange(0, 0);
-    }
+    resetTrail(trail);
   }
 
   function applyTheme(name: 'light' | 'dark'): void {
@@ -276,7 +331,7 @@
 
     if (frameGroup) {
       scene.remove(frameGroup);
-      disposeObject(frameGroup);
+      disposeTree(frameGroup);
     }
     frameGroup = buildFrame();
     scene.add(frameGroup);
@@ -284,7 +339,7 @@
     // The vehicle model keeps its own GLB materials across themes; only recolor
     // the flight trail to the theme accent.
     if (trail) {
-      (trail.material as three.LineBasicMaterial).color.set(pal.xAxis);
+      (trail.line.material as three.LineBasicMaterial).color.set(pal.xAxis);
     }
 
     updateVehicle(pose, attitude);
@@ -408,7 +463,7 @@
 
     if (missionGroup) {
       scene.remove(missionGroup);
-      disposeObject(missionGroup);
+      disposeTree(missionGroup);
       missionGroup = null;
     }
     if (!plan || plan.waypoints.every((wp) => wp === null)) {
@@ -500,24 +555,6 @@
     );
   }
 
-  function disposeObject(root: Object3D): void {
-    root.traverse((object: Object3D) => {
-      const renderable = object as Object3D & {
-        geometry?: BufferGeometry;
-        material?: Material | Material[];
-      };
-      renderable.geometry?.dispose();
-      if (renderable.material) {
-        const materials = Array.isArray(renderable.material) ? renderable.material : [renderable.material];
-        for (const material of materials) {
-          const materialWithMap = material as Material & { map?: { dispose: () => void } };
-          materialWithMap.map?.dispose();
-          material.dispose();
-        }
-      }
-    });
-  }
-
   function updateVehicle(nextPose: Pose | null, nextAttitude: Attitude | null): void {
     if (!vehicleGroup || !nextPose) {
       return;
@@ -526,7 +563,22 @@
     const vehiclePosition = localPositionToScene(nextPose);
     vehicleGroup.position.copy(vehiclePosition);
     vehicleGroup.quaternion.copy(attitudeToSceneQuaternion(nextAttitude));
-    recordTrail(vehiclePosition);
+    recordTrail(trail, vehiclePosition);
+    refreshSourceOverlay();
+  }
+
+  /**
+   * Draw the second source as a wire airframe at its own pose and attitude.
+   * Not the vehicle model: two solid aircraft would read as two aircraft.
+   */
+  function updateSecondary(nextPose: Pose | null, nextAttitude: Attitude | null): void {
+    if (secondaryMarker && nextPose) {
+      const position = localPositionToScene(nextPose);
+      secondaryMarker.root.position.copy(position);
+      secondaryMarker.root.quaternion.copy(attitudeToSceneQuaternion(nextAttitude));
+      recordTrail(secondaryTrail, position);
+    }
+    refreshSourceOverlay();
   }
 
   function attitudeToSceneQuaternion(nextAttitude: Attitude | null): three.Quaternion {
@@ -574,22 +626,175 @@
     return new three.Vector3(enu.x, enu.z, -enu.y).normalize();
   }
 
-  function recordTrail(position: Vector3): void {
-    if (!trail || !trailPositions) {
+  function recordTrail(target: Trail | null, position: Vector3): void {
+    if (!target) {
       return;
     }
-    if (trailCount >= MAX_TRAIL) {
-      trailPositions.copyWithin(0, 3);
-      trailCount = MAX_TRAIL - 1;
+    if (target.count >= MAX_TRAIL) {
+      target.positions.copyWithin(0, 3);
+      target.count = MAX_TRAIL - 1;
     }
-    const index = trailCount;
-    trailPositions[index * 3] = position.x;
-    trailPositions[index * 3 + 1] = position.y;
-    trailPositions[index * 3 + 2] = position.z;
-    trailCount++;
-    const attribute = trail.geometry.getAttribute('position') as three.BufferAttribute;
+    const index = target.count;
+    target.positions[index * 3] = position.x;
+    target.positions[index * 3 + 1] = position.y;
+    target.positions[index * 3 + 2] = position.z;
+    target.count++;
+    const attribute = target.line.geometry.getAttribute('position') as three.BufferAttribute;
     attribute.needsUpdate = true;
-    trail.geometry.setDrawRange(0, Math.min(trailCount, MAX_TRAIL));
+    target.line.geometry.setDrawRange(0, Math.min(target.count, MAX_TRAIL));
+  }
+
+  function resetTrail(target: Trail | null): void {
+    if (!target) {
+      return;
+    }
+    target.count = 0;
+    target.line.geometry.setDrawRange(0, 0);
+  }
+
+  /**
+   * Rebuild the two-source overlay when the sources or the palette change.
+   * An empty `primaryLabel` means there is nothing to disambiguate, so the
+   * overlay is torn down entirely and the view is the plain single-vehicle one.
+   */
+  function updateSourceOverlay(
+    nextPrimary: string,
+    nextSecondary: string,
+    nextPrimaryColor: string,
+    nextSecondaryColor: string,
+    nextTheme: 'light' | 'dark'
+  ): void {
+    if (!scene) {
+      return;
+    }
+    const signature = `${nextPrimary}|${nextSecondary}|${nextPrimaryColor}|${nextSecondaryColor}|${nextTheme}`;
+    if (signature === sourceSignature) {
+      return;
+    }
+    sourceSignature = signature;
+    clearSourceOverlay();
+    if (!nextPrimary.trim()) {
+      return;
+    }
+    buildSourceOverlay(nextPrimary, nextSecondary, nextPrimaryColor, nextSecondaryColor);
+    updateSecondary(secondaryPose, secondaryAttitude);
+  }
+
+  function buildSourceOverlay(
+    labelPrimary: string,
+    labelSecondary: string,
+    colorPrimary: string,
+    colorSecondary: string
+  ): void {
+    const group = new three.Group();
+
+    primaryHalo = createSourceHalo(HALO_RADIUS_SCENE, colorPrimary);
+    group.add(primaryHalo);
+    primaryLabelSprite = createSourceLabel(labelPrimary, colorPrimary, pal.labelShadow);
+    primaryLabelSprite.scale.set(LABEL_SCALE[0], LABEL_SCALE[1], 1);
+    group.add(primaryLabelSprite);
+
+    if (labelSecondary.trim()) {
+      secondaryMarker = createSourceMarker(VEHICLE_FIT * 1.7, colorSecondary);
+      group.add(secondaryMarker.root);
+      secondaryHalo = createSourceHalo(HALO_RADIUS_SCENE, colorSecondary);
+      group.add(secondaryHalo);
+      secondaryLabelSprite = createSourceLabel(labelSecondary, colorSecondary, pal.labelShadow);
+      secondaryLabelSprite.scale.set(LABEL_SCALE[0], LABEL_SCALE[1], 1);
+      group.add(secondaryLabelSprite);
+
+      offsetLine = new three.Line(
+        new three.BufferGeometry().setFromPoints([new three.Vector3(), new three.Vector3()]),
+        new three.LineBasicMaterial({ color: colorSecondary, transparent: true, opacity: 0.45 })
+      );
+      group.add(offsetLine);
+
+      secondaryTrail = createTrail(colorSecondary, 0.5);
+      group.add(secondaryTrail.line);
+    }
+
+    sourceGroup = group;
+    scene?.add(group);
+  }
+
+  function clearSourceOverlay(): void {
+    if (vehicleGroup) {
+      // Only the overlay hides the model; without it there is one source and
+      // the view is always drawn.
+      vehicleGroup.visible = true;
+    }
+    if (sourceGroup) {
+      scene?.remove(sourceGroup);
+      disposeTree(sourceGroup);
+    }
+    sourceGroup = null;
+    secondaryMarker = null;
+    primaryHalo = null;
+    secondaryHalo = null;
+    primaryLabelSprite = null;
+    secondaryLabelSprite = null;
+    offsetLine = null;
+    secondaryTrail = null;
+  }
+
+  /** Park the halos, labels and offset line on the poses they annotate. */
+  function refreshSourceOverlay(): void {
+    if (!sourceGroup || !vehicleGroup) {
+      return;
+    }
+    // With the overlay on, the model carries a source's name, so it must not be
+    // left parked at a stale position when that source stops reporting.
+    const hasPrimary = pose !== null;
+    vehicleGroup.visible = hasPrimary;
+    if (primaryHalo) {
+      primaryHalo.visible = hasPrimary;
+    }
+    if (primaryLabelSprite) {
+      primaryLabelSprite.visible = hasPrimary;
+    }
+
+    const primaryPosition = vehicleGroup.position;
+    primaryHalo?.position.set(primaryPosition.x, FLOOR_MARK_SCENE_Y, primaryPosition.z);
+    primaryLabelSprite?.position.set(
+      primaryPosition.x,
+      primaryPosition.y + LABEL_LIFT_SCENE_Y,
+      primaryPosition.z
+    );
+
+    const hasSecondary = secondaryPose !== null && secondaryMarker !== null;
+    if (secondaryMarker) {
+      secondaryMarker.root.visible = hasSecondary;
+    }
+    if (secondaryHalo) {
+      secondaryHalo.visible = hasSecondary;
+    }
+    if (secondaryLabelSprite) {
+      secondaryLabelSprite.visible = hasSecondary;
+    }
+    if (secondaryTrail) {
+      secondaryTrail.line.visible = hasSecondary;
+    }
+    if (offsetLine) {
+      offsetLine.visible = hasSecondary && hasPrimary;
+    }
+    if (!hasSecondary || !secondaryMarker) {
+      return;
+    }
+
+    const secondaryPosition = secondaryMarker.root.position;
+    secondaryHalo?.position.set(secondaryPosition.x, FLOOR_MARK_SCENE_Y, secondaryPosition.z);
+    secondaryLabelSprite?.position.set(
+      secondaryPosition.x,
+      secondaryPosition.y + LABEL_LIFT_SCENE_Y,
+      secondaryPosition.z
+    );
+    if (offsetLine) {
+      const points = offsetLine.geometry.getAttribute('position') as three.BufferAttribute;
+      points.setXYZ(0, primaryPosition.x, primaryPosition.y, primaryPosition.z);
+      points.setXYZ(1, secondaryPosition.x, secondaryPosition.y, secondaryPosition.z);
+      points.needsUpdate = true;
+      offsetLine.geometry.computeBoundingSphere();
+    }
   }
 
   function localPositionToScene(nextPose: Pose): Vector3 {
@@ -672,7 +877,15 @@
     missionGroup = null;
     missionSignature = '';
     trail = null;
-    trailPositions = null;
+    sourceGroup = null;
+    sourceSignature = '';
+    secondaryMarker = null;
+    primaryHalo = null;
+    secondaryHalo = null;
+    primaryLabelSprite = null;
+    secondaryLabelSprite = null;
+    offsetLine = null;
+    secondaryTrail = null;
     resizeObserver = null;
   }
 
@@ -718,6 +931,35 @@
   >
     {followMode ? 'Following' : 'Follow'}
   </button>
+  {#if showSources}
+    <div class="source-legend">
+      <div class="source-row">
+        <span class="swatch" style={`background:${primaryColor};`}></span>
+        <span class="source-name">{primaryLabel}</span>
+        <strong>
+          {pose
+            ? `${pose.xM.toFixed(2)}, ${pose.yM.toFixed(2)}, ${pose.altM.toFixed(2)} m`
+            : 'no pose'}
+        </strong>
+      </div>
+      {#if secondaryLabel}
+        <div class="source-row">
+          <span class="swatch outline" style={`border-color:${secondaryColor};`}></span>
+          <span class="source-name">{secondaryLabel}</span>
+          <strong>
+            {secondaryPose
+              ? `${secondaryPose.xM.toFixed(2)}, ${secondaryPose.yM.toFixed(2)}, ${secondaryPose.altM.toFixed(2)} m`
+              : 'no pose'}
+          </strong>
+        </div>
+        <div class="source-row separation">
+          <span class="swatch spacer"></span>
+          <span class="source-name">Separation</span>
+          <strong>{separationM !== null ? `${separationM.toFixed(2)} m` : '--'}</strong>
+        </div>
+      {/if}
+    </div>
+  {/if}
   <div class="indoor-readout">
     <div>
       <span>Local X</span>
@@ -808,6 +1050,79 @@
   .indoor-scene.light .follow-toggle.active {
     border-color: #e35f0c;
     background: rgba(227, 95, 12, 0.16);
+    color: #a04208;
+  }
+
+  .source-legend {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    display: grid;
+    gap: 4px;
+    padding: 8px 10px;
+    border: 1px solid rgba(253, 119, 25, 0.2);
+    border-radius: 8px;
+    background: rgba(5, 8, 8, 0.74);
+    backdrop-filter: blur(5px);
+    pointer-events: none;
+  }
+
+  .source-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .source-row .swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 3px;
+    flex: none;
+  }
+
+  .source-row .swatch.outline {
+    background: transparent;
+    border: 2px solid;
+    border-radius: 50%;
+  }
+
+  .source-row .swatch.spacer {
+    background: transparent;
+  }
+
+  .source-row .source-name {
+    min-width: 74px;
+    color: #91a39c;
+    font-size: 0.62rem;
+    font-weight: 760;
+    text-transform: uppercase;
+  }
+
+  .source-row strong {
+    color: #edf6f1;
+    font-size: 0.72rem;
+    font-weight: 760;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .source-row.separation strong {
+    color: #ffc35a;
+  }
+
+  .indoor-scene.light .source-legend {
+    border-color: rgba(227, 95, 12, 0.28);
+    background: rgba(255, 255, 255, 0.86);
+  }
+
+  .indoor-scene.light .source-row .source-name {
+    color: #5c6873;
+  }
+
+  .indoor-scene.light .source-row strong {
+    color: #12171b;
+  }
+
+  .indoor-scene.light .source-row.separation strong {
     color: #a04208;
   }
 
