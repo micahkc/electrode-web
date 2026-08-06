@@ -8,6 +8,7 @@ members = [
   "crates/electrode-log",
   "crates/electrode-manual-control-bridge",
   "crates/electrode-ppm-bridge",
+  "crates/electrode-telemetry-bridge",
   "xtask"
 ]
 resolver = "2"

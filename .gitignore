@@ -14,3 +14,4 @@ pkg/
 /electrode-autopilot.json
 /electrode-simulation.json
 /electrode-mapping.json
+/electrode-mocap.json

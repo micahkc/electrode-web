@@ -21,11 +21,11 @@ use flatbuffers::root;
 use serde_json::{json, Value};
 use synapse_fbs::topic::{
     AttitudeCommandData, AttitudeEstimateData, AttitudeEstimateFlags, ControlLoopMetricsData,
-    ManualControlData, ManualControlFlags, MocapFrame, MocapPoseFrame, MocapRawFlags,
-    NavigationTargetData, PowerStatusData, PwmSignalOutputsData, RadioControlData, RawPoseData,
-    VehicleHealthData, VehicleHealthFlags,
+    GnssFixData, GnssFixFlags, ManualControlData, ManualControlFlags, MocapFrame, MocapPoseFrame,
+    MocapRawFlags, NavigationTargetData, PowerStatusData, PwmSignalOutputsData, RadioControlData,
+    RawPoseData, SensorComponentFlags, VehicleHealthData, VehicleHealthFlags,
 };
-use synapse_fbs::types::RotationMatrix3f;
+use synapse_fbs::types::{GnssFixType, RotationMatrix3f};
 
 /// A payload decoded (or passed through) from a Zenoh sample.
 pub(crate) struct Decoded {
@@ -60,6 +60,7 @@ fn schema_for_topic(name: &str) -> Option<&'static str> {
         "MocapPoseFrame" => "MocapPoseFrame",
         "ManualControlCommand" => "ManualControl",
         "RadioControl" => "RadioControl",
+        "GnssFix" => "GnssFix",
         "PwmSignalOutputs" => "PwmSignalOutputs",
         "AttitudeEstimate" => "AttitudeEstimate",
         "AttitudeCommand" => "AttitudeCommand",
@@ -116,6 +117,7 @@ pub(crate) fn decode(key: &str, encoding: Option<&str>, bytes: &[u8]) -> Decoded
         "MocapPoseFrame" => decode_or_raw("MocapPoseFrame", bytes, decode_mocap_pose_frame),
         "ManualControl" => decode_or_raw("ManualControl", bytes, decode_manual_control),
         "RadioControl" => decode_or_raw("RadioControl", bytes, decode_radio_control),
+        "GnssFix" => decode_or_raw("GnssFix", bytes, decode_gnss_fix),
         "PwmSignalOutputs" => decode_or_raw("PwmSignalOutputs", bytes, decode_pwm_signal_outputs),
         "AttitudeEstimate" => decode_or_raw("AttitudeEstimate", bytes, decode_attitude_estimate),
         "AttitudeCommand" => decode_or_raw("AttitudeCommand", bytes, decode_attitude_command),
@@ -252,21 +254,158 @@ fn decode_attitude_estimate(bytes: &[u8]) -> Option<Value> {
     }))
 }
 
+/// `SensorComponentFlags` bit names, for reporting which components are down.
+const SENSOR_COMPONENT_NAMES: [(SensorComponentFlags, &str); 16] = [
+    (SensorComponentFlags::Gyro, "gyro"),
+    (SensorComponentFlags::Accel, "accel"),
+    (SensorComponentFlags::Mag, "mag"),
+    (SensorComponentFlags::AbsolutePressure, "baro"),
+    (SensorComponentFlags::DifferentialPressure, "airspeed"),
+    (SensorComponentFlags::Gnss, "gnss"),
+    (SensorComponentFlags::OpticalFlow, "optical flow"),
+    (SensorComponentFlags::VisionPosition, "vision"),
+    (SensorComponentFlags::Rangefinder, "rangefinder"),
+    (SensorComponentFlags::RadioControl, "rc"),
+    (SensorComponentFlags::MotorOutputs, "motors"),
+    (SensorComponentFlags::Battery, "battery"),
+    (SensorComponentFlags::Estimator, "estimator"),
+    (SensorComponentFlags::Logging, "logging"),
+    (SensorComponentFlags::CommandLink, "command link"),
+    (SensorComponentFlags::Terrain, "terrain"),
+];
+
+fn sensor_component_names(mask: SensorComponentFlags) -> Vec<&'static str> {
+    SENSOR_COMPONENT_NAMES
+        .iter()
+        .filter(|(bit, _)| mask.contains(*bit))
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+/// Decode a `health` (VehicleHealth) struct.
+///
+/// The sensor bitmasks are the authoritative health signal: a component that is
+/// enabled but missing from `sensors_health` has failed, and some producers
+/// report that while never setting the `Failsafe` flag at all. Battery and load
+/// are null unless the vehicle actually reports those subsystems, because a
+/// producer with no battery monitor leaves the fields at zero, which would
+/// otherwise render as a flat pack rather than as no data.
 fn decode_vehicle_health(bytes: &[u8]) -> Option<Value> {
     let data = decode_struct::<VehicleHealthData>(bytes, 48)?;
     let flags = VehicleHealthFlags::from_bits_retain(data.flags());
+    let present = SensorComponentFlags::from_bits_retain(data.sensors_present());
+    let enabled = SensorComponentFlags::from_bits_retain(data.sensors_enabled());
+    let health = SensorComponentFlags::from_bits_retain(data.sensors_health());
+    let unhealthy = enabled.difference(health);
+    let battery_present = present.contains(SensorComponentFlags::Battery);
+    let load_dpermille = data.load_dpermille();
+
     Some(json!({
         "data": {
             "timestamp_us": data.timestamp_us(),
             "flight_mode": data.flight_mode(),
             "link_quality_pct": data.link_quality_pct(),
-            "voltage_battery_v": f64::from(data.voltage_battery_cv()) / 100.0,
-            "current_battery_a": f64::from(data.current_battery_da()) / 10.0,
-            "battery_remaining_pct": data.battery_remaining_pct(),
+            "sensors_present": present.bits(),
+            "sensors_enabled": enabled.bits(),
+            "sensors_health": health.bits(),
+            "unhealthy_sensors": sensor_component_names(unhealthy),
+            "battery_present": battery_present,
+            "voltage_battery_v": battery_present
+                .then(|| f64::from(data.voltage_battery_cv()) / 100.0),
+            "current_battery_a": battery_present
+                .then(|| f64::from(data.current_battery_da()) / 10.0),
+            "battery_remaining_pct": battery_present.then(|| data.battery_remaining_pct()),
             "armed": flags.contains(VehicleHealthFlags::Armed),
-            "failsafe": flags.contains(VehicleHealthFlags::Failsafe),
+            // An enabled-but-unhealthy component is a failsafe condition even
+            // when the producer never raises the flag itself.
+            "failsafe": flags.contains(VehicleHealthFlags::Failsafe) || !unhealthy.is_empty(),
+            "failsafe_flag": flags.contains(VehicleHealthFlags::Failsafe),
             "system_state": data.system_state(),
-            "load_pct": f64::from(data.load_dpermille()) / 10.0
+            // A running vehicle never reports exactly 0.0% load, so treat it as
+            // "not reported" rather than as an idle CPU.
+            "load_pct": (load_dpermille > 0).then(|| f64::from(load_dpermille) / 10.0)
+        }
+    }))
+}
+
+/// The schema defines 65535 as "at or above 65.535 m, unusable". Producers with
+/// no accuracy estimate saturate rather than truncate, so this is a "no figure
+/// available" sentinel, not a large-but-real one.
+const UNUSABLE_ACCURACY: u16 = u16::MAX;
+
+fn accuracy_or_null(milli: u16) -> Option<f64> {
+    (milli != UNUSABLE_ACCURACY).then(|| f64::from(milli) / 1000.0)
+}
+
+fn gnss_fix_type_name(fix_type: GnssFixType) -> &'static str {
+    match fix_type {
+        GnssFixType::NoFix => "no fix",
+        GnssFixType::TimeOnly => "time only",
+        GnssFixType::Fix2d => "2D",
+        GnssFixType::Fix3d => "3D",
+        GnssFixType::Dgnss => "DGNSS",
+        GnssFixType::RtkFloat => "RTK float",
+        GnssFixType::RtkFixed => "RTK fixed",
+        GnssFixType::DeadReckoning => "dead reckoning",
+        _ => "unknown",
+    }
+}
+
+/// Decode a `gnss` (GnssFix) struct.
+///
+/// Every field a producer may leave unpopulated is null rather than its zero
+/// value, because a zero here is indistinguishable from a real measurement and
+/// would render as one: 0 m accuracy reads as perfect, and a zeroed lat/lon
+/// plots as a position in the Gulf of Guinea.
+fn decode_gnss_fix(bytes: &[u8]) -> Option<Value> {
+    let data = decode_struct::<GnssFixData>(bytes, 64)?;
+    let flags = GnssFixFlags::from_bits_retain(data.flags());
+    let fix_type = data.fix_type();
+    // There is no position-valid flag, and producers publish samples while the
+    // receiver is still acquiring — deliberately, so that "receiver alive, no
+    // lock yet" is distinguishable from "receiver silent". fix_type is the only
+    // signal that the position fields mean anything.
+    let position_valid = fix_type.0 >= GnssFixType::Fix2d.0;
+    let yaw_valid = flags.contains(GnssFixFlags::YawValid);
+    let satellites_used = data.satellites_used();
+    let satellites_visible = data.satellites_visible();
+
+    Some(json!({
+        "data": {
+            "timestamp_us": data.timestamp_us(),
+            "fix_type": fix_type.0,
+            "fix_type_name": gnss_fix_type_name(fix_type),
+            "position_valid": position_valid,
+            "latitude_deg": position_valid.then(|| f64::from(data.latitude_deg_e7()) / 1e7),
+            "longitude_deg": position_valid.then(|| f64::from(data.longitude_deg_e7()) / 1e7),
+            "altitude_msl_m": position_valid.then(|| f64::from(data.altitude_msl_mm()) / 1000.0),
+            "altitude_ellipsoid_m": position_valid
+                .then(|| f64::from(data.altitude_ellipsoid_mm()) / 1000.0),
+            "horizontal_accuracy_m": accuracy_or_null(data.horizontal_accuracy_mm()),
+            "vertical_accuracy_m": accuracy_or_null(data.vertical_accuracy_mm()),
+            "velocity_accuracy_mps": accuracy_or_null(data.velocity_accuracy_mm_s()),
+            // A real fix never has a DOP below 1, so 0 means "not reported".
+            "hdop": (data.hdop_centi() > 0).then(|| f64::from(data.hdop_centi()) / 100.0),
+            "vdop": (data.vdop_centi() > 0).then(|| f64::from(data.vdop_centi()) / 100.0),
+            "ground_speed_mps": f64::from(data.ground_speed_cm_s()) / 100.0,
+            "course_over_ground_deg": flags
+                .contains(GnssFixFlags::CourseValid)
+                .then(|| f64::from(data.course_over_ground_cdeg()) / 100.0),
+            "yaw_deg": yaw_valid.then(|| f64::from(data.yaw_cdeg()) / 100.0),
+            // Gated on YawValid as well: a producer that does not compute
+            // heading leaves the accuracy at 0 instead of saturating it, and 0
+            // would read as a perfect heading rather than a missing one.
+            "yaw_accuracy_deg": yaw_valid.then(|| f64::from(data.yaw_accuracy_cdeg()) / 100.0),
+            "velocity_up_mps": flags
+                .contains(GnssFixFlags::VelocityUpValid)
+                .then(|| f64::from(data.velocity_up_cm_s()) / 100.0),
+            "time_unix_us": flags.contains(GnssFixFlags::TimeValid).then(|| data.time_unix_us()),
+            "satellites_used": satellites_used,
+            // Visible can never be below used; a smaller value means the
+            // producer does not report it.
+            "satellites_visible": (satellites_visible >= satellites_used)
+                .then_some(satellites_visible),
+            "id": data.id()
         }
     }))
 }
@@ -580,7 +719,7 @@ fn normalize_quaternion(quaternion: (f32, f32, f32, f32)) -> (f32, f32, f32, f32
 
 #[cfg(test)]
 mod tests {
-    use super::contract_error;
+    use super::{contract_error, decode_gnss_fix, decode_vehicle_health};
 
     #[test]
     fn accepts_zenoh_pico_byte_wrapper_around_exact_contract() {
@@ -589,5 +728,89 @@ mod tests {
         let wrapped = format!("zenoh/bytes;{expected}");
 
         assert_eq!(contract_error("pwm", Some(&wrapped)), None);
+    }
+
+    /// Field offsets are the vehicle's own struct layout, padding included.
+    fn gnss_bytes(fix_type: u8, latitude_deg_e7: i32, longitude_deg_e7: i32) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 64];
+        bytes[16..20].copy_from_slice(&latitude_deg_e7.to_le_bytes());
+        bytes[20..24].copy_from_slice(&longitude_deg_e7.to_le_bytes());
+        // The onboard NMEA path saturates every accuracy field.
+        bytes[32..34].copy_from_slice(&u16::MAX.to_le_bytes());
+        bytes[34..36].copy_from_slice(&u16::MAX.to_le_bytes());
+        bytes[36..38].copy_from_slice(&u16::MAX.to_le_bytes());
+        bytes[53] = fix_type;
+        bytes
+    }
+
+    #[test]
+    fn decodes_a_locked_gnss_fix() {
+        let value = decode_gnss_fix(&gnss_bytes(3, 377_749_000, -1_224_194_000)).expect("decoded");
+        let data = &value["data"];
+
+        assert_eq!(data["position_valid"], true);
+        assert_eq!(data["fix_type_name"], "3D");
+        assert_eq!(data["latitude_deg"], 37.7749);
+        assert_eq!(data["longitude_deg"], -122.4194);
+        // Saturated means unusable, not 65.5 m.
+        assert!(data["horizontal_accuracy_m"].is_null());
+    }
+
+    /// The vehicle streams while the receiver acquires, and those samples carry
+    /// a zeroed position that would otherwise plot off West Africa.
+    #[test]
+    fn reports_no_position_before_the_receiver_locks() {
+        for fix_type in [0, 1] {
+            let value = decode_gnss_fix(&gnss_bytes(fix_type, 0, 0)).expect("decoded");
+            let data = &value["data"];
+
+            assert_eq!(data["position_valid"], false);
+            assert!(data["latitude_deg"].is_null());
+            assert!(data["longitude_deg"].is_null());
+        }
+    }
+
+    fn health_bytes(present: u32, enabled: u32, health: u32, flags: u8) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 48];
+        bytes[8..12].copy_from_slice(&present.to_le_bytes());
+        bytes[12..16].copy_from_slice(&enabled.to_le_bytes());
+        bytes[16..20].copy_from_slice(&health.to_le_bytes());
+        bytes[47] = flags;
+        bytes
+    }
+
+    #[test]
+    fn reports_no_battery_when_the_vehicle_has_no_battery_component() {
+        const GYRO_ACCEL_MOTORS: u32 = 1 | 2 | 1024;
+        let value = decode_vehicle_health(&health_bytes(
+            GYRO_ACCEL_MOTORS,
+            GYRO_ACCEL_MOTORS,
+            GYRO_ACCEL_MOTORS,
+            1,
+        ))
+        .expect("decoded");
+        let data = &value["data"];
+
+        assert_eq!(data["battery_present"], false);
+        assert!(data["voltage_battery_v"].is_null());
+        assert!(data["battery_remaining_pct"].is_null());
+        assert!(data["load_pct"].is_null());
+    }
+
+    /// The sensor bitmask is the authoritative failsafe indicator: RDD2 raises
+    /// Armed but never the Failsafe flag itself.
+    #[test]
+    fn raises_failsafe_when_an_enabled_component_drops_out_of_health() {
+        const RADIO_CONTROL: u32 = 512;
+        const ENABLED: u32 = 1 | 2 | RADIO_CONTROL | 1024 | 4096;
+        let value =
+            decode_vehicle_health(&health_bytes(ENABLED, ENABLED, ENABLED & !RADIO_CONTROL, 1))
+                .expect("decoded");
+        let data = &value["data"];
+
+        assert_eq!(data["armed"], true);
+        assert_eq!(data["failsafe_flag"], false);
+        assert_eq!(data["failsafe"], true);
+        assert_eq!(data["unhealthy_sensors"], serde_json::json!(["rc"]));
     }
 }

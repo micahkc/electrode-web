@@ -202,6 +202,51 @@ const SYNAPSE_PACKET_TEMPLATES: KnownPacketTemplate[] = [
     ]
   },
   {
+    // Pairs with `att` to plot desired against actual attitude.
+    topic: 'att_sp',
+    schema: 'synapse.topic.AttitudeCommand',
+    label: 'AttitudeCommand',
+    source: 'synapse_fbs',
+    fields: [
+      numberField('data.timestamp_us', 'Timestamp', 'us'),
+      ...quatFields('data.attitude', 'Attitude setpoint'),
+      ...rateFields('data.body_rate_flu_rad_s', 'Body rate setpoint')
+    ]
+  },
+  {
+    topic: 'gnss',
+    schema: 'synapse.topic.GnssFix',
+    label: 'GnssFix',
+    source: 'synapse_fbs',
+    fields: [
+      numberField('data.timestamp_us', 'Timestamp', 'us'),
+      numberField('data.fix_type', 'Fix type', ''),
+      booleanField('data.position_valid', 'Position valid'),
+      numberField('data.latitude_deg', 'Latitude', 'deg'),
+      numberField('data.longitude_deg', 'Longitude', 'deg'),
+      numberField('data.altitude_msl_m', 'Altitude MSL', 'm'),
+      numberField('data.horizontal_accuracy_m', 'Horizontal accuracy', 'm'),
+      numberField('data.vertical_accuracy_m', 'Vertical accuracy', 'm'),
+      numberField('data.ground_speed_mps', 'Ground speed', 'm/s'),
+      numberField('data.course_over_ground_deg', 'Course over ground', 'deg'),
+      numberField('data.satellites_used', 'Satellites used', ''),
+      numberField('data.hdop', 'HDOP', '')
+    ]
+  },
+  {
+    // `latency_us` is the measured IMU-interrupt to DSHOT-trigger hot-path
+    // latency, and the most useful number on a telemetry link for tuning.
+    topic: 'loop',
+    schema: 'synapse.topic.ControlLoopMetrics',
+    label: 'ControlLoopMetrics',
+    source: 'synapse_fbs',
+    fields: [
+      numberField('data.timestamp_us', 'Timestamp', 'us'),
+      numberField('data.period_us', 'Period', 'us'),
+      numberField('data.latency_us', 'Latency', 'us')
+    ]
+  },
+  {
     topic: 'health',
     schema: 'synapse.topic.VehicleHealth',
     label: 'VehicleHealth',
@@ -210,6 +255,9 @@ const SYNAPSE_PACKET_TEMPLATES: KnownPacketTemplate[] = [
       numberField('data.timestamp_us', 'Timestamp', 'us'),
       numberField('data.flight_mode', 'Flight mode', ''),
       numberField('data.link_quality_pct', 'Link quality', '%'),
+      numberField('data.sensors_present', 'Sensors present', ''),
+      numberField('data.sensors_enabled', 'Sensors enabled', ''),
+      numberField('data.sensors_health', 'Sensors healthy', ''),
       numberField('data.voltage_battery_v', 'Voltage', 'V'),
       numberField('data.current_battery_a', 'Current', 'A'),
       numberField('data.battery_remaining_pct', 'Battery remaining', '%'),

@@ -21,7 +21,8 @@ viewer and as the UI served by the local Rust ground-station daemon.
   including joystick discovery, RC mapping, PPM bridge control, simulation
   control, and autopilot profile management.
 - Includes native Rust tools for ground-station serving, manual-control input,
-  PPM output, fake simulation, and bridge-compatible testing.
+  PPM output, RDD2 telemetry-radio decoding, fake simulation, and
+  bridge-compatible testing.
 
 ## Repository Layout
 
@@ -32,6 +33,7 @@ packages/electrode-flatbuffers Pregenerated schema assets shared by the SDK
 crates/electrode-ground-station Local daemon that serves the app and gcs/* APIs
 crates/electrode-manual-control-bridge USB joystick to Synapse ManualControl
 crates/electrode-ppm-bridge    Synapse manual/autopilot output to serial PPM
+crates/electrode-telemetry-bridge RDD2 CSyn serial telemetry link to Synapse/Zenoh
 crates/electrode-fake-sim      Zenoh/Synapse fake vehicle publisher
 docs                           Architecture, safety, lifecycle, and topic notes
 ```

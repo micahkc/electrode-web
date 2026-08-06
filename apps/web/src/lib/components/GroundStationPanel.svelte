@@ -4,6 +4,8 @@
   import { groundStation } from '$lib/capabilities';
 
   export let theme: 'light' | 'dark' = 'dark';
+  /** The PPM encoder is fixed-wing hardware; the rdd2 quad has none. */
+  export let showPpm = true;
 
   const POLL_MS = 2000;
 
@@ -68,7 +70,7 @@
       {/if}
     </div>
 
-    <div class="group">
+    <div class="group" class:hidden={!showPpm}>
       <span class="label">Serial / PPM</span>
       {#if serial.length === 0}
         <span class="chip empty">no serial device</span>
@@ -95,6 +97,11 @@
 </section>
 
 <style>
+  /* Compound so it wins over `.group { display: flex }` regardless of order. */
+  .group.hidden {
+    display: none;
+  }
+
   .gcs-bar {
     display: flex;
     align-items: center;

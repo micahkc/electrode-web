@@ -30,6 +30,16 @@ impl Supervisor {
         }
     }
 
+    pub(crate) fn telemetry_bridge() -> Self {
+        Self {
+            bin: resolve_sibling_bin(
+                "ELECTRODE_TELEMETRY_BRIDGE_BIN",
+                "electrode-telemetry-bridge",
+            ),
+            child: Mutex::new(None),
+        }
+    }
+
     /// Path to the bridge binary this supervisor will launch.
     pub(crate) fn bin_display(&self) -> String {
         self.bin.display().to_string()

@@ -17,9 +17,18 @@
       fetchBridgeStatus,
       requestRuntimeParameter,
       setPpmBridgeRunning,
+      setMocapGnssEnabled,
+      setTelemetryRunning,
+      fetchTelemetryStatus,
+      fetchMocapStatus,
+      saveMocapAddress,
+      saveTelemetryProfile,
       setAutopilotRunning,
       setBridgeRunning,
-      type AutopilotRunStatus
+      type AutopilotRunStatus,
+      type DetectedDevice,
+      type MocapStatus,
+      type TelemetryProfile
     } from '$lib/gcs';
   import {
     Activity,
@@ -32,6 +41,7 @@
     Moon,
     Power,
     Radio,
+    Radar,
     RotateCcw,
     Settings,
     Square,
@@ -44,8 +54,10 @@
     createPlotPacketCatalog,
     createInitialVehicleState,
     plotPacketKey,
+    type Attitude,
     type ConnectionState,
     type MissionWaypoint,
+    type Pose,
     type PlotFieldDefinition,
     type PlotPacketDefinition,
     type PlotSeries,
@@ -72,6 +84,12 @@
   type MapViewMode = '2d' | '3d';
   type VehicleKind = 'quadrotor' | 'fixedwing';
   type GroundStationPage = 'dashboard' | 'autopilot-config' | 'radio-config' | 'sim';
+  /**
+   * Which airframe the dashboard is laid out for. The two have genuinely
+   * different questions: a plane needs control surfaces and manual link, the
+   * rdd2 quad needs its telemetry radio, GNSS and the odometry it flies on.
+   */
+  type DashboardProfile = 'plane' | 'drone';
   type PlotTraceSelection = {
     packetKey: string;
     fieldPath: string;
@@ -89,6 +107,44 @@
 
   const vehicleId = 'electrode-01';
   const mapViewModes: MapViewMode[] = ['2d', '3d'];
+  const dashboardProfiles: Array<{ key: DashboardProfile; label: string }> = [
+    { key: 'plane', label: 'Plane' },
+    { key: 'drone', label: 'rdd2' }
+  ];
+  /** Which pose/orientation source the 3D view draws. */
+  type OdomSource = 'telemetry' | 'mocap';
+  const odomSources: Array<{ key: OdomSource; label: string }> = [
+    { key: 'telemetry', label: 'Telemetry' },
+    { key: 'mocap', label: 'Mocap' }
+  ];
+
+  function poseForSource(
+    source: OdomSource | null,
+    fromTelemetry: Pose | null,
+    fromMocap: Pose | null
+  ): Pose | null {
+    if (source === 'telemetry') return fromTelemetry;
+    if (source === 'mocap') return fromMocap;
+    return null;
+  }
+
+  function attitudeForSource(
+    source: OdomSource | null,
+    fromTelemetry: Attitude | null,
+    fromMocap: Attitude | null
+  ): Attitude | null {
+    if (source === 'telemetry') return fromTelemetry;
+    if (source === 'mocap') return fromMocap;
+    return null;
+  }
+  /**
+   * Fixed colour per source, so the identity of a marker never depends on
+   * which of the two is currently driving the vehicle model.
+   */
+  const SOURCE_COLORS: Record<OdomSource, string> = {
+    telemetry: '#fd7719',
+    mocap: '#35d0ff'
+  };
   const groundStationPages: Array<{ key: GroundStationPage; label: string }> = [
     { key: 'dashboard', label: 'Dashboard' },
     { key: 'autopilot-config', label: 'Autopilot Config' },
@@ -198,9 +254,15 @@
   let worker: Worker | null = null;
   let theme: ThemeName = 'dark';
   let activePage: GroundStationPage = initialGroundStationPage();
+  let dashboardProfile: DashboardProfile = initialDashboardProfile();
+  // Independent, not a two-way switch: comparing the sources means seeing both,
+  // and isolating one means hiding the other rather than promoting it.
+  let showTelemetryView = true;
+  let showMocapView = true;
   let runtimeMode: RuntimeMode = 'zenoh';
   let mapViewMode: MapViewMode = initialMapViewMode();
-  let selectedVehicleType: VehicleKind = 'fixedwing';
+  let selectedVehicleType: VehicleKind =
+    initialDashboardProfile() === 'drone' ? 'quadrotor' : 'fixedwing';
   let zenohEndpoint = 'ws/127.0.0.1:7447';
   let vehicle = createInitialVehicleState(vehicleId);
   let replay: ReplayState = { loaded: false, playing: false, cursorMs: 0, durationMs: 0, speed: 1, frameCount: 0 };
@@ -224,6 +286,117 @@
   $: radioControl = vehicle.radioControl;
   $: motors = vehicle.motors;
   $: link = vehicle.link;
+  $: gnss = vehicle.gnss;
+  /**
+   * Mocap GPS is a flag on the bridge that owns the radio: with no bridge
+   * running nothing is being uplinked, whatever the stored profile says.
+   */
+  $: mocapGnssActive = telemetryRunning && (telemetryProfile?.mocapGnss ?? false);
+
+  $: telemetryPose = (() => {
+    if (!gnss?.positionValid || !telemetryProfile) return null;
+    const offset = telemetryLocalOffset(gnss, telemetryProfile);
+    if (!offset) return null;
+    return {
+      lat: gnss.lat ?? 0,
+      lon: gnss.lon ?? 0,
+      altM: (gnss.altMslM ?? 0) - telemetryProfile.originAlt,
+      xM: offset.xM,
+      yM: offset.yM,
+      zM: 0
+    };
+  })();
+
+  /**
+   * Mocap pose/attitude, kept apart so both sources can be drawn together.
+   * Dropped once tracking goes stale: a marker frozen where the vehicle was
+   * last seen is worse than no marker.
+   */
+  $: mocapLive = vehicle.localization.source.startsWith('mocap') && vehicle.localization.fresh;
+  $: mocapPose = mocapLive ? vehicle.mocapPose : null;
+  $: mocapAttitude = mocapLive ? vehicle.mocapAttitude : null;
+
+  // Mocap health has two independent halves, and conflating them sends the
+  // operator to the wrong place: the network link to the capture machine can be
+  // up while nothing is being captured, and a tracked body can go stale while
+  // the link stays perfectly healthy.
+  $: mocapSourceName = vehicle.localization.source;
+  $: mocapStreamState = !mocapSourceName.startsWith('mocap')
+    ? 'no mocap stream'
+    : mocapSourceName.includes('degraded')
+      ? 'tracking lost'
+      : !vehicle.localization.fresh
+        ? 'stale'
+        : 'valid';
+  $: mocapStreamValid = mocapStreamState === 'valid';
+  $: mocapLinkNote = !$isGroundStation
+    ? 'viewer'
+    : mocapLinkError
+      ? 'link status unavailable'
+      : !mocapLink?.endpoint
+        ? 'no capture machine set'
+        : mocapLink.connected
+          ? `linked · ${mocapLink.endpoint}`
+          : `unreachable · ${mocapLink.endpoint}`;
+  $: telemetryAttitude = vehicle.attitudeEstimate;
+
+  // What the 3D view draws. Telemetry odometry is the estimator's attitude with
+  // position from GNSS; mocap is the local frame the capture system owns. The
+  // The two sources are shown independently: each has its own toggle, so both,
+  // one, or neither can be on the screen. The one drawn with the solid vehicle
+  // model is whichever is enabled, telemetry first when both are; the other
+  // gets the wire marker. Their colours are fixed, so which is which never
+  // depends on that choice.
+  //
+  // The selector is drone-only, so the plane keeps the canonical pose rather
+  // than being reprojected through the drone's geodetic calibration.
+  //
+  // No cross-source fallback on the drone: once a marker carries a source's
+  // name, filling it in from the other source would make the two agree exactly
+  // whenever one of them is missing — the one reading that must never be
+  // fabricated. A source with no data is drawn as absent instead.
+  $: enabledSources = (
+    dashboardProfile !== 'drone'
+      ? []
+      : [
+          ...(showTelemetryView ? (['telemetry'] as const) : []),
+          ...(showMocapView ? (['mocap'] as const) : [])
+        ]
+  ) as OdomSource[];
+  $: primarySource = enabledSources[0] ?? null;
+  $: secondarySource = enabledSources[1] ?? null;
+  $: displayPose =
+    dashboardProfile !== 'drone' ? pose : poseForSource(primarySource, telemetryPose, mocapPose);
+  $: displayAttitude =
+    dashboardProfile !== 'drone'
+      ? attitude
+      : attitudeForSource(primarySource, telemetryAttitude, mocapAttitude);
+  $: comparePose = poseForSource(secondarySource, telemetryPose, mocapPose);
+  $: compareAttitude = attitudeForSource(secondarySource, telemetryAttitude, mocapAttitude);
+  // Empty labels switch the two-source overlay off, which is what the plane
+  // dashboard wants: it has one source and nothing to disambiguate.
+  $: primarySourceLabel = primarySource ?? '';
+  $: secondarySourceLabel = secondarySource ?? '';
+  $: ghostNote =
+    dashboardProfile !== 'drone'
+      ? ''
+      : enabledSources.length === 0
+        ? ' · no source shown'
+        : secondarySource === null
+          ? ` · ${primarySource} only`
+          : comparePose
+            ? ` · vs ${secondarySource}`
+            : ` · no ${secondarySource} to compare`;
+  $: odomSourceNote =
+    primarySource === null
+      ? 'nothing drawn'
+      : primarySource === 'telemetry'
+        ? gnss?.positionValid
+          ? 'GNSS + estimator'
+          : 'estimator only · no GNSS lock'
+        : vehicle.localization.source.startsWith('mocap')
+          ? `${vehicle.localization.source} · ${vehicle.localization.fresh ? 'fresh' : 'stale'}`
+          : 'no mocap source';
   $: mission = vehicle.mission;
   // 2D map projection of the mission plan, using the same metres→percent
   // mapping as the vehicle marker.
@@ -269,6 +442,35 @@
   }
   $: ioHealth = topicByCatalogName(vehicle, 'VehicleHealth');
   $: ioAttitude = topicByCatalogName(vehicle, 'AttitudeEstimate');
+  $: ioGnss = topicByCatalogName(vehicle, 'GnssFix');
+  // Autopilot, Radio and SIM configure the fixed-wing path; the rdd2 flies on
+  // its telemetry radio and has none of that hardware in the loop.
+  $: visibleGroundStationPages =
+    dashboardProfile === 'drone'
+      ? groundStationPages.filter((page) => page.key === 'dashboard')
+      : groundStationPages;
+  /** The six topics the RDD2 telemetry radio carries. */
+  const TELEMETRY_TOPIC_NAMES = [
+    'VehicleHealth',
+    'GnssFix',
+    'AttitudeEstimate',
+    'AttitudeCommand',
+    'PwmSignalOutputs',
+    'ControlLoopMetrics'
+  ];
+  /**
+   * Catalog name for a telemetry key. The snapshot label is the last key
+   * segment, which for an instanced topic like `gnss/0` is just the instance.
+   */
+  function telemetryTopicName(topic: string): string {
+    return parseKey(topic)?.topic.name ?? topic;
+  }
+  $: telemetryTopics = Object.values(vehicle.topics)
+    .filter((snapshot) => {
+      const parsed = parseKey(snapshot.topic);
+      return parsed ? TELEMETRY_TOPIC_NAMES.includes(parsed.topic.name) : false;
+    })
+    .sort((a, b) => telemetryTopicName(a.topic).localeCompare(telemetryTopicName(b.topic)));
   $: ioSelectedPwm = topicBySuffix(vehicle, 'motor_output');
   $: ioPwm = ioSelectedPwm && !ioSelectedPwm.stale ? ioSelectedPwm : topicByCatalogName(vehicle, 'PwmSignalOutputs');
   $: ioManual = topicByCatalogName(vehicle, 'ManualControlCommand');
@@ -336,6 +538,19 @@
   let manualBridgeBusy = false;
   let manualBridgeStatus = 'checking...';
   let ppmBridgeRunning = false;
+  let telemetryRunning = false;
+  let mocapGnssBusy = false;
+  let telemetryBusy = false;
+  let telemetryDevice = '';
+  let telemetryProfile: TelemetryProfile | null = null;
+  let serialDevices: DetectedDevice[] = [];
+  let mocapLink: MocapStatus | null = null;
+  let mocapAddress = '';
+  let mocapAddressDirty = false;
+  let mocapAddressFocused = false;
+  let mocapBusy = false;
+  let mocapError = '';
+  let mocapLinkError = '';
   let ppmBridgeBusy = false;
   let joystickPresent = false;
   let keyboardRevision = 0;
@@ -386,13 +601,113 @@
     }
   }
 
+  async function refreshTelemetry(): Promise<void> {
+    if (!$isGroundStation) return;
+    try {
+      const status = await fetchTelemetryStatus();
+      telemetryRunning = status.running;
+      telemetryProfile = status.profile;
+      // Do not fight the operator while they are typing a device path.
+      if (!telemetryDeviceDirty) {
+        telemetryDevice = status.profile.serialDevice;
+      }
+    } catch {
+      // The daemon may not expose telemetry yet; leave the last known state.
+    }
+  }
+
+  let telemetryDeviceDirty = false;
+
+  /** Apply the typed serial device, then start or stop the telemetry bridge. */
+  async function toggleTelemetry(): Promise<void> {
+    if (telemetryBusy) return;
+    telemetryBusy = true;
+    try {
+      if (telemetryProfile && telemetryDevice.trim() && telemetryDevice !== telemetryProfile.serialDevice) {
+        const saved = await saveTelemetryProfile({
+          ...telemetryProfile,
+          serialDevice: telemetryDevice.trim()
+        });
+        telemetryProfile = saved.profile;
+      }
+      const status = await setTelemetryRunning(!telemetryRunning);
+      telemetryRunning = status.running;
+      telemetryProfile = status.profile;
+      telemetryDeviceDirty = false;
+      manualBridgeStatus = status.running
+        ? `telemetry radio on ${status.profile.serialDevice}`
+        : 'telemetry radio stopped';
+    } catch (error) {
+      manualBridgeStatus = error instanceof Error ? error.message : 'telemetry toggle failed';
+    } finally {
+      telemetryBusy = false;
+    }
+  }
+
+  async function toggleMocapGnss(): Promise<void> {
+    if (mocapGnssBusy) return;
+    mocapGnssBusy = true;
+    const next = !mocapGnssActive;
+    try {
+      let status = await setMocapGnssEnabled(next);
+      // The uplink is a flag on the bridge that owns the radio, so turning it
+      // on with no bridge running would change nothing the operator can see.
+      if (next && !status.running) {
+        status = await setTelemetryRunning(true);
+      }
+      telemetryRunning = status.running;
+      telemetryProfile = status.profile;
+    } catch (error) {
+      manualBridgeStatus = error instanceof Error ? error.message : 'mocap GPS toggle failed';
+    } finally {
+      mocapGnssBusy = false;
+    }
+  }
+
+  async function refreshMocapLink(): Promise<void> {
+    if (!$isGroundStation) return;
+    try {
+      const status = await fetchMocapStatus();
+      mocapLink = status;
+      mocapLinkError = '';
+      // Never overwrite an address being typed. Focus is the guard rather than
+      // the edit flag alone: a poll landing between focus and the first
+      // keystroke would otherwise replace what was just typed.
+      if (!mocapAddressDirty && !mocapAddressFocused) {
+        mocapAddress = status.address;
+      }
+    } catch (error) {
+      // Say why the panel is empty. Silently keeping the last status hides a
+      // daemon that predates this route behind "no capture machine set".
+      mocapLinkError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function applyMocapAddress(): Promise<void> {
+    if (mocapBusy) return;
+    mocapBusy = true;
+    mocapError = '';
+    try {
+      mocapLink = await saveMocapAddress(mocapAddress.trim());
+      mocapAddress = mocapLink.address;
+      mocapAddressDirty = false;
+    } catch (error) {
+      mocapError = error instanceof Error ? error.message : String(error);
+    } finally {
+      mocapBusy = false;
+    }
+  }
+
   async function refreshManualBridge(): Promise<void> {
     if (!$isGroundStation) return;
+    void refreshTelemetry();
+    void refreshMocapLink();
     try {
       const [status, devices] = await Promise.all([fetchBridgeStatus(), fetchDevices()]);
       manualBridgeRunning = status.running;
       ppmBridgeRunning = status.ppmRunning ?? false;
       joystickPresent = devices.joysticks.length > 0;
+      serialDevices = devices.serial;
       manualBridgeStatus = status.running
         ? `manual publisher active · ${status.bin}`
         : status.ppmRunning
@@ -584,6 +899,63 @@
 
     const requested = new URLSearchParams(window.location.search).get('page') as GroundStationPage | null;
     return requested && groundStationPages.some((page) => page.key === requested) ? requested : 'dashboard';
+  }
+
+  function initialDashboardProfile(): DashboardProfile {
+    if (typeof window === 'undefined') {
+      return 'plane';
+    }
+    const requested = new URLSearchParams(window.location.search).get(
+      'airframe'
+    ) as DashboardProfile | null;
+    return requested && dashboardProfiles.some((entry) => entry.key === requested)
+      ? requested
+      : 'plane';
+  }
+
+  function setDashboardProfile(profile: DashboardProfile): void {
+    dashboardProfile = profile;
+    // The vehicle model follows the dashboard: a quad dashboard showing a
+    // fixed-wing rig would be its own kind of wrong.
+    selectedVehicleType = profile === 'drone' ? 'quadrotor' : 'fixedwing';
+    if (profile === 'drone' && activePage !== 'dashboard') {
+      setGroundStationPage('dashboard');
+    }
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    url.searchParams.set('airframe', profile);
+    window.history.replaceState({}, '', url);
+  }
+
+  /**
+   * Vehicle position in the mocap frame, from the GNSS fix it reports.
+   *
+   * This is the exact inverse of what the uplink applies: `sample_to_fix`
+   * rotates mocap ENU by `yaw_offset` and converts about the configured origin,
+   * so undoing both puts telemetry and mocap in one frame and makes them
+   * directly comparable. Using anything else — the first fix seen, say — leaves
+   * the two in frames offset and rotated from each other, and they can never
+   * appear to converge no matter how well the estimator tracks.
+   */
+  function telemetryLocalOffset(
+    fix: { lat: number | null; lon: number | null },
+    profile: TelemetryProfile
+  ): { xM: number; yM: number } | null {
+    if (fix.lat === null || fix.lon === null) return null;
+    const wgs84A = 6_378_137;
+    const wgs84F = 1 / 298.257223563;
+    const e2 = 1 - (1 - wgs84F) ** 2;
+    const lat0 = (profile.originLat * Math.PI) / 180;
+    const n = wgs84A / Math.sqrt(1 - e2 * Math.sin(lat0) ** 2);
+    const radius = n + profile.originAlt;
+    const north = ((fix.lat - profile.originLat) * Math.PI * radius) / 180;
+    const east = ((fix.lon - profile.originLon) * Math.PI * radius * Math.cos(lat0)) / 180;
+    // Un-rotate the facility frame the uplink rotated onto true north.
+    const a = (-profile.yawOffsetDeg * Math.PI) / 180;
+    return {
+      xM: east * Math.cos(a) - north * Math.sin(a),
+      yM: east * Math.sin(a) + north * Math.cos(a)
+    };
   }
 
   function setGroundStationPage(page: GroundStationPage): void {
@@ -881,6 +1253,20 @@
     </div>
 
     <div class="header-actions">
+      <div class="airframe-switch" aria-label="Airframe dashboard">
+        {#each dashboardProfiles as entry}
+          <button
+            type="button"
+            class:active={dashboardProfile === entry.key}
+            onclick={() => setDashboardProfile(entry.key)}
+            title={entry.key === 'drone'
+              ? 'rdd2 quadrotor: telemetry radio, GNSS and odometry'
+              : 'Fixed wing: control surfaces and manual link'}
+          >
+            {entry.label}
+          </button>
+        {/each}
+      </div>
       <details class="settings-menu">
         <summary class="icon-button quiet" aria-label="Settings" title="Settings">
           <Settings size={18} />
@@ -902,7 +1288,7 @@
 
   {#if $isGroundStation}
     <nav class="ground-nav" aria-label="Ground Station sections">
-      {#each groundStationPages as page}
+      {#each visibleGroundStationPages as page}
         <button
           type="button"
           class:active={activePage === page.key}
@@ -916,13 +1302,13 @@
 
   {#if !$isGroundStation || activePage === 'dashboard'}
     {#if $isGroundStation}
-      <GroundStationPanel {theme} />
+      <GroundStationPanel {theme} showPpm={dashboardProfile !== 'drone'} />
     {/if}
 
     <div class="dashboard">
 
     {#if $isGroundStation}
-      <section class="panel autopilot-panel">
+      <section class="panel autopilot-panel" class:hidden={dashboardProfile === 'drone'}>
         <div class="panel-heading">
           <div>
             <h2>Autopilot</h2>
@@ -968,7 +1354,7 @@
       </section>
     {/if}
 
-    <section class="panel io-panel">
+    <section class="panel io-panel" class:hidden={dashboardProfile === 'drone'}>
       <div class="panel-heading">
         <div>
           <h2>State I/O</h2>
@@ -1097,13 +1483,307 @@
       </div>
     </section>
 
+    {#if dashboardProfile === 'drone'}
+      <section class="panel telemetry-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Telemetry Link</h2>
+            <p>{telemetryRunning ? `radio on ${telemetryProfile?.serialDevice ?? ''}` : 'radio stopped'}</p>
+          </div>
+          <Radio size={20} />
+        </div>
+
+        {#if $isGroundStation}
+          <div class="telemetry-controls">
+          <input
+            class="telemetry-device"
+            type="text"
+            list="telemetry-serial-devices"
+            bind:value={telemetryDevice}
+            oninput={() => (telemetryDeviceDirty = true)}
+            placeholder="Select or type a serial device"
+            title="Serial device the telemetry radio presents. Prefer a /dev/serial/by-id/ path:
+ttyUSB numbering can swap between boots when more than one adapter is attached."
+          />
+          <datalist id="telemetry-serial-devices">
+            {#each serialDevices as device}
+              <option value={device.path}>{device.name}</option>
+            {/each}
+          </datalist>
+          <button
+            type="button"
+            class="icon-button"
+            class:primary={!telemetryRunning}
+            class:danger={telemetryRunning}
+            onclick={() => void toggleTelemetry()}
+            disabled={telemetryBusy}
+            title="Start/stop decoding the telemetry radio onto Zenoh"
+          >
+            {#if telemetryRunning}
+              <Square size={18} />
+              <span>Stop telemetry</span>
+            {:else}
+              <CirclePlay size={18} />
+              <span>Telemetry</span>
+            {/if}
+          </button>
+          <button
+            type="button"
+            class="icon-button"
+            class:primary={!mocapGnssActive}
+            class:danger={mocapGnssActive}
+            onclick={() => void toggleMocapGnss()}
+            disabled={mocapGnssBusy}
+            title="Send mocap pose to the vehicle as a GNSS fix over the telemetry radio. Needs a
+vehicle built -S mocap-gnss; the default build drops injected fixes."
+          >
+            {#if mocapGnssActive}
+              <Square size={18} />
+              <span>Stop mocap GPS</span>
+            {:else}
+              <CirclePlay size={18} />
+              <span>Mocap GPS</span>
+            {/if}
+          </button>
+          </div>
+        {:else}
+          <div class="io-row">
+            <span>Control</span>
+            <strong>ground station only</strong>
+          </div>
+        {/if}
+
+        <div class="io-group">
+          <h3>GNSS</h3>
+
+        {#if gnss}
+          <div class="io-row">
+            <span>Fix <em>{ioRate(ioGnss)}</em></span>
+            <strong class:on={gnss.positionValid} class:warn={!gnss.positionValid}>
+              {gnss.fixTypeName} · {gnss.satellitesUsed}{gnss.satellitesVisible !== null
+                ? `/${gnss.satellitesVisible}`
+                : ''} sats
+            </strong>
+          </div>
+          <div class="io-row">
+            <span>Position</span>
+            <!-- Below a 2D lock the fix carries no usable position, so say so
+                 rather than plotting a zeroed latitude and longitude. -->
+            <strong>
+              {gnss.positionValid && gnss.lat !== null && gnss.lon !== null
+                ? `${gnss.lat.toFixed(7)}, ${gnss.lon.toFixed(7)}`
+                : 'no position'}
+            </strong>
+          </div>
+          <div class="io-row">
+            <span>Altitude MSL</span>
+            <strong>{gnss.altMslM !== null ? `${format(gnss.altMslM, 2)} m` : '--'}</strong>
+          </div>
+          <div class="io-row">
+            <!-- Null means the receiver reported no estimate (saturated on the
+                 wire), which is not the same as a large one. -->
+            <span>Accuracy <em>1σ</em></span>
+            <strong>
+              {gnss.horizontalAccuracyM !== null || gnss.verticalAccuracyM !== null
+                ? `h ${gnss.horizontalAccuracyM !== null ? `${format(gnss.horizontalAccuracyM, 2)} m` : '--'} · v ${gnss.verticalAccuracyM !== null ? `${format(gnss.verticalAccuracyM, 2)} m` : '--'}`
+                : 'not reported'}
+            </strong>
+          </div>
+          <div class="io-row">
+            <span>Ground speed</span>
+            <strong>
+              {format(gnss.groundSpeedMps, 2)} m/s{gnss.courseOverGroundDeg !== null
+                ? ` · course ${format(gnss.courseOverGroundDeg, 1)}°`
+                : ''}{gnss.hdop !== null ? ` · HDOP ${format(gnss.hdop, 2)}` : ''}
+            </strong>
+          </div>
+        {:else}
+          <div class="io-row">
+            <span>Fix</span>
+            <strong>no GNSS telemetry</strong>
+          </div>
+        {/if}
+        </div>
+
+        <div class="io-group">
+          <h3>Topics from telemetry</h3>
+          {#if telemetryTopics.length === 0}
+            <div class="io-row">
+              <span>Streams</span>
+              <strong>no telemetry topics</strong>
+            </div>
+          {:else}
+            {#each telemetryTopics as snapshot}
+              <div class="io-row" title={snapshot.topic}>
+                <span>
+                  {telemetryTopicName(snapshot.topic)}
+                  <em>{snapshot.stale ? 'stale' : 'live'}</em>
+                </span>
+                <strong>{snapshot.rateHz.toFixed(1)} Hz · {snapshot.samples} samples</strong>
+              </div>
+            {/each}
+          {/if}
+        </div>
+      </section>
+    {/if}
+
+    <!-- Both airframes fly on mocap indoors, so the capture link is configured
+         from either dashboard rather than only the one it was asked for on. -->
+    <section class="panel mocap-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Mocap</h2>
+          <p>{mocapLinkNote}</p>
+        </div>
+        <Radar size={20} />
+      </div>
+
+      {#if $isGroundStation}
+        <div class="telemetry-controls">
+          <input
+            class="telemetry-device"
+            type="text"
+            bind:value={mocapAddress}
+            oninput={() => (mocapAddressDirty = true)}
+            onfocus={() => (mocapAddressFocused = true)}
+            onblur={() => (mocapAddressFocused = false)}
+            onkeydown={(event) => {
+              if (event.key === 'Enter') {
+                void applyMocapAddress();
+              }
+            }}
+            placeholder="Capture machine, e.g. 192.168.10.2"
+            title="Address of the machine publishing motion capture. A bare address gets tcp
+and port 7447; paste a full Zenoh locator (udp/…, ws/…) to override that. Blank
+disconnects the link."
+          />
+          <button
+            type="button"
+            class="icon-button primary"
+            onclick={() => void applyMocapAddress()}
+            disabled={mocapBusy}
+            title="Reopen the mocap link against this address. Applied in place; no restart."
+          >
+            <Radio size={18} />
+            <span>{mocapBusy ? 'Applying…' : 'Apply'}</span>
+          </button>
+        </div>
+        {#if mocapError}
+          <div class="io-row">
+            <span>Request</span>
+            <strong class="danger">{mocapError}</strong>
+          </div>
+        {/if}
+      {:else}
+        <div class="io-row">
+          <span>Link</span>
+          <strong>ground station only</strong>
+        </div>
+      {/if}
+
+      <div class="io-group">
+        <h3>Link</h3>
+        {#if mocapLinkError}
+          <div class="io-row">
+            <span>Status</span>
+            <strong class="danger">{mocapLinkError}</strong>
+          </div>
+        {/if}
+        <div class="io-row">
+          <span>Endpoint</span>
+          <strong>{mocapLink?.endpoint ?? (mocapLinkError ? 'unknown' : 'not configured')}</strong>
+        </div>
+        <div class="io-row">
+          <!-- A session opens against an address with nothing listening, so
+               "reachable" is peer count, not whether the socket was created. -->
+          <span>Reachable</span>
+          <strong class:on={mocapLink?.connected} class:warn={!mocapLink?.connected}>
+            {mocapLink?.endpoint
+              ? mocapLink.connected
+                ? `yes · ${mocapLink.peers} peer${mocapLink.peers === 1 ? '' : 's'}`
+                : 'nothing answering'
+              : '--'}
+          </strong>
+        </div>
+        {#if mocapLink?.error}
+          <div class="io-row">
+            <span>Last error</span>
+            <strong class="danger">{mocapLink.error}</strong>
+          </div>
+        {/if}
+      </div>
+
+      <div class="io-group">
+        <h3>Stream</h3>
+        <div class="io-row">
+          <span>Pose <em>{ioRate(ioMocap)}</em></span>
+          <strong class:on={mocapStreamValid} class:warn={!mocapStreamValid}>
+            {mocapStreamState}
+          </strong>
+        </div>
+        <div class="io-row">
+          <span>Source</span>
+          <strong>{mocapSourceName === 'none' ? 'no source' : mocapSourceName}</strong>
+        </div>
+        <div class="io-row">
+          <span>Tracking quality</span>
+          <strong>{format(vehicle.localization.quality * 100, 0)}%</strong>
+        </div>
+        <div class="io-row">
+          <span>Rigid body</span>
+          <strong>
+            {mocapPose
+              ? `${mocapPose.xM.toFixed(2)}, ${mocapPose.yM.toFixed(2)}, ${mocapPose.altM.toFixed(2)} m`
+              : 'no pose'}
+          </strong>
+        </div>
+        <div class="io-row">
+          <span>Attitude</span>
+          <strong>
+            {mocapAttitude
+              ? `${mocapAttitude.rollDeg.toFixed(0)}° ${mocapAttitude.pitchDeg.toFixed(0)}° ${mocapAttitude.yawDeg.toFixed(0)}°`
+              : 'no attitude'}
+          </strong>
+        </div>
+      </div>
+    </section>
+
     <section class="panel map-panel">
       <div class="panel-heading map-heading">
         <div>
           <h2>Map</h2>
-          <p>{mapSubtitle}</p>
+          <p>
+            {mapSubtitle}{dashboardProfile === 'drone' && mapViewMode === '3d'
+              ? ` · ${odomSourceNote}${ghostNote}`
+              : ''}
+          </p>
         </div>
         <div class="map-tools">
+          {#if dashboardProfile === 'drone'}
+            <!-- Two independent toggles, not a two-way switch: comparing the
+                 sources means seeing both. Also drives Control Surfaces, so it
+                 stays available in 2D. -->
+            <div class="map-view-control source-toggles" aria-label="Odometry sources shown">
+              {#each odomSources as option}
+                <button
+                  type="button"
+                  aria-pressed={option.key === 'telemetry' ? showTelemetryView : showMocapView}
+                  class:active={option.key === 'telemetry' ? showTelemetryView : showMocapView}
+                  onclick={() => {
+                    if (option.key === 'telemetry') {
+                      showTelemetryView = !showTelemetryView;
+                    } else {
+                      showMocapView = !showMocapView;
+                    }
+                  }}
+                  title="Show or hide {option.label.toLowerCase()} odometry. Both can be on at once."
+                >
+                  <span class="source-dot" style={`background:${SOURCE_COLORS[option.key]};`}></span>
+                  {option.label}
+                </button>
+              {/each}
+            </div>
+          {/if}
           <div class="map-view-control" aria-label="Map view mode">
             {#each mapViewModes as option}
               <button
@@ -1169,11 +1849,18 @@
         </div>
       {:else}
         <IndoorScene
-          {pose}
-          {attitude}
+          pose={displayPose}
+          attitude={displayAttitude}
           {controls}
           {motors}
           {mission}
+          secondaryPose={dashboardProfile === 'drone' ? comparePose : null}
+          secondaryAttitude={dashboardProfile === 'drone' ? compareAttitude : null}
+          primaryLabel={primarySourceLabel}
+          secondaryLabel={secondarySourceLabel}
+          compareSources={dashboardProfile === 'drone'}
+          primaryColor={primarySource ? SOURCE_COLORS[primarySource] : '#fd7719'}
+          secondaryColor={secondarySource ? SOURCE_COLORS[secondarySource] : '#35d0ff'}
           localizationQuality={vehicle.localization.quality}
           {theme}
           bind:vehicleType={selectedVehicleType}
@@ -1185,14 +1872,30 @@
       <div class="panel-heading">
         <div>
           <h2>Control Surfaces</h2>
-          <p>deflection · top &amp; rear</p>
+          <p>
+            deflection · top &amp; rear{dashboardProfile === 'drone'
+              ? ` · ${enabledSources.length > 0 ? enabledSources.join(' + ') : 'no source shown'}`
+              : ''}
+          </p>
         </div>
         <Gauge size={20} />
       </div>
-      <DeflectionView {attitude} controls={deflectionControls} {motors} {theme} bind:vehicleType={selectedVehicleType} />
+      <DeflectionView
+        attitude={displayAttitude}
+        secondaryAttitude={dashboardProfile === 'drone' ? compareAttitude : null}
+        primaryLabel={primarySourceLabel}
+        secondaryLabel={secondarySourceLabel}
+        compareSources={dashboardProfile === 'drone'}
+        primaryColor={primarySource ? SOURCE_COLORS[primarySource] : '#fd7719'}
+        secondaryColor={secondarySource ? SOURCE_COLORS[secondarySource] : '#35d0ff'}
+        controls={deflectionControls}
+        {motors}
+        {theme}
+        bind:vehicleType={selectedVehicleType}
+      />
     </section>
 
-    <section class="panel manual-panel">
+    <section class="panel manual-panel" class:hidden={dashboardProfile === 'drone'}>
       <div class="panel-heading">
         <div>
           <h2>Manual Link</h2>
@@ -1226,6 +1929,7 @@
             class:primary={!ppmBridgeRunning}
             class:danger={ppmBridgeRunning}
             onclick={() => void togglePpmBridge()}
+            hidden={dashboardProfile === 'drone'}
             disabled={ppmBridgeBusy}
             title="Start/stop the Arduino PPM serial bridge"
           >
@@ -1623,7 +2327,9 @@
         <Radio size={24} />
       </div>
       <RcMappingPanel {theme} />
-      <PpmHardwarePanel {theme} channels={radioControl} />
+      {#if dashboardProfile !== 'drone'}
+        <PpmHardwarePanel {theme} channels={radioControl} />
+      {/if}
     </section>
   {:else}
     <SimulationPanel {theme} {zenohEndpoint} />
@@ -1890,6 +2596,55 @@
 
   .ok {
     color: #147660;
+  }
+
+  /* Compound so it wins over the per-panel display rules regardless of order. */
+  .panel.hidden {
+    display: none;
+  }
+
+  .airframe-switch {
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.25);
+  }
+
+  .airframe-switch button {
+    padding: 0.3rem 0.7rem;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+    opacity: 0.65;
+  }
+
+  .airframe-switch button.active {
+    background: rgba(255, 255, 255, 0.14);
+    opacity: 1;
+  }
+
+  .telemetry-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .telemetry-device {
+    min-width: 14rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(0, 0, 0, 0.25);
+    color: inherit;
+    font: inherit;
+    font-size: 0.8rem;
   }
 
   .warn {
@@ -3210,6 +3965,43 @@
     grid-area: auto;
     grid-column: 2;
     grid-row: span 30;
+  }
+
+  /* Column 3 is free on the drone dashboard: State I/O and Manual Link are
+     plane panels and hidden there. */
+  .telemetry-panel {
+    grid-area: auto;
+    grid-column: 3;
+    grid-row: span 78;
+    /* Panels are sized by their row span, so anything taller is clipped. Scroll
+       rather than silently hide a topic the operator is looking for. */
+    overflow-y: auto;
+  }
+
+  /* Independent toggles rather than a segmented picker, so an inactive one
+     reads as "hidden" instead of "the other one is selected". */
+  .source-toggles button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .source-toggles .source-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    opacity: 0.35;
+  }
+
+  .source-toggles button.active .source-dot {
+    opacity: 1;
+  }
+
+  .mocap-panel {
+    grid-area: auto;
+    grid-column: 3;
+    grid-row: span 82;
+    overflow-y: auto;
   }
 
   .events-panel .event-list,

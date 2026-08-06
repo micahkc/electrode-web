@@ -106,6 +106,7 @@ describe('state store telemetry pipeline', () => {
     expect(state.localization).toMatchObject({ source: 'mocap', fresh: true });
   });
 
+
   it('marks connection and localization stale when topic deadlines pass', () => {
     let state = createInitialVehicleState('cubs2');
     const frames = makeSimulatedTelemetryBundle({
@@ -309,5 +310,156 @@ describe('mocap state handling', () => {
     expect(state.attitude?.yawDeg).toBeCloseTo(0, 6);
     expect(state.lastMocap).toMatchObject({ xM: 7.4, yM: -10.3, altM: 0.32 });
     expect(state.localization).toMatchObject({ source: 'mocap', fresh: false, quality: 0 });
+  });
+});
+
+describe('attitude source precedence', () => {
+  const estimateFrame = (nowMs: number) =>
+    telemetryFrame(
+      'att',
+      { data: { attitude: { w: Math.SQRT1_2, x: 0, y: 0, z: Math.SQRT1_2 }, attitude_valid: true } },
+      nowMs
+    );
+
+  const mocapFrame = (nowMs: number) =>
+    telemetryFrame(
+      'synapse/mocap/rigid_body/cub1/pose',
+      {
+        rigid_bodies: [
+          { position: { x: 1, y: 2, z: 3 }, attitude: { w: 1, x: 0, y: 0, z: 0 }, residual: 0, tracking_valid: true }
+        ]
+      },
+      nowMs
+    );
+
+  // A vehicle on a telemetry radio has no mocap at all. Withholding the
+  // estimator would leave the HUD and vehicle model frozen while perfectly
+  // good attitude telemetry was arriving.
+  it('displays estimator attitude when no mocap source exists', () => {
+    let state = createInitialVehicleState('rdd2');
+
+    state = applyGcsFrame(state, estimateFrame(10_000), 10_000);
+
+    expect(state.attitude?.yawDeg).toBeCloseTo(90, 6);
+    expect(state.attitudeEstimate?.yawDeg).toBeCloseTo(90, 6);
+  });
+
+  it('hands the displayed attitude back to the estimator once mocap goes quiet', () => {
+    let state = setMocapDisplaySource(createInitialVehicleState('cubs2'), 'raw');
+
+    state = applyGcsFrame(state, mocapFrame(10_000), 10_000);
+    // Still inside the hold window: mocap keeps the display.
+    state = applyGcsFrame(state, estimateFrame(10_500), 10_500);
+    expect(state.attitude?.yawDeg).toBeCloseTo(0, 6);
+
+    // Mocap has been quiet past the hold; the estimator takes over.
+    state = applyGcsFrame(state, estimateFrame(11_500), 11_500);
+    expect(state.attitude?.yawDeg).toBeCloseTo(90, 6);
+  });
+
+  // The 3D view draws both sources at once and labels each. It can only do
+  // that if mocap keeps its own pose and attitude after the estimator has
+  // taken the canonical ones over.
+  it('keeps the mocap pose and attitude addressable once the estimator owns the display', () => {
+    let state = setMocapDisplaySource(createInitialVehicleState('cubs2'), 'raw');
+
+    state = applyGcsFrame(state, mocapFrame(10_000), 10_000);
+    state = applyGcsFrame(state, estimateFrame(11_500), 11_500);
+
+    expect(state.attitude?.yawDeg).toBeCloseTo(90, 6);
+    expect(state.attitudeEstimate?.yawDeg).toBeCloseTo(90, 6);
+    expect(state.mocapAttitude?.yawDeg).toBeCloseTo(0, 6);
+    expect(state.mocapPose).toMatchObject({ xM: 1, yM: 2, altM: 3 });
+  });
+});
+
+describe('GNSS telemetry', () => {
+  function gnssFrame(data: Record<string, unknown>, nowMs: number) {
+    return telemetryFrame('gnss', { data }, nowMs);
+  }
+
+  it('applies a locked fix to the global pose', () => {
+    let state = createInitialVehicleState('rdd2');
+    state = applyGcsFrame(
+      state,
+      gnssFrame(
+        {
+          position_valid: true,
+          fix_type: 3,
+          fix_type_name: '3D',
+          latitude_deg: 37.7749,
+          longitude_deg: -122.4194,
+          altitude_msl_m: 12,
+          ground_speed_mps: 3.5,
+          satellites_used: 11,
+          horizontal_accuracy_m: 1.5
+        },
+        10_000
+      ),
+      10_000
+    );
+
+    expect(state.pose).toMatchObject({ lat: 37.7749, lon: -122.4194, altM: 12 });
+    expect(state.gnss).toMatchObject({
+      positionValid: true,
+      fixTypeName: '3D',
+      satellitesUsed: 11,
+      groundSpeedMps: 3.5
+    });
+  });
+
+  // The receiver streams while acquiring, and those samples carry a zeroed
+  // position. Applying one would teleport the vehicle marker to null island.
+  it('records an unlocked fix without moving the vehicle', () => {
+    let state = createInitialVehicleState('rdd2');
+    state = applyGcsFrame(
+      state,
+      gnssFrame(
+        {
+          position_valid: true,
+          fix_type: 3,
+          latitude_deg: 37.7749,
+          longitude_deg: -122.4194,
+          altitude_msl_m: 12
+        },
+        10_000
+      ),
+      10_000
+    );
+    state = applyGcsFrame(
+      state,
+      gnssFrame(
+        {
+          position_valid: false,
+          fix_type: 0,
+          fix_type_name: 'no fix',
+          latitude_deg: null,
+          longitude_deg: null,
+          satellites_used: 0
+        },
+        10_200
+      ),
+      10_200
+    );
+
+    expect(state.pose).toMatchObject({ lat: 37.7749, lon: -122.4194 });
+    expect(state.gnss).toMatchObject({ positionValid: false, fixTypeName: 'no fix' });
+  });
+
+  // GNSS owns the global fix only; the local frame belongs to mocap or the
+  // estimator, so a fix must not reset it.
+  it('preserves the local frame owned by another source', () => {
+    let state = createInitialVehicleState('rdd2');
+    state.pose = { lat: 0, lon: 0, altM: 0, xM: 7.4, yM: -10.3, zM: 1.2 };
+    state = applyGcsFrame(
+      state,
+      gnssFrame(
+        { position_valid: true, fix_type: 3, latitude_deg: 1.5, longitude_deg: 2.5, altitude_msl_m: 30 },
+        10_000
+      ),
+      10_000
+    );
+
+    expect(state.pose).toMatchObject({ lat: 1.5, lon: 2.5, altM: 30, xM: 7.4, yM: -10.3, zM: 1.2 });
   });
 });

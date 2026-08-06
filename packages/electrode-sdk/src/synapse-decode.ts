@@ -28,6 +28,9 @@ import { ControlLoopMetricsData } from './generated/synapse/topic/control-loop-m
 import { ExternalOdometryData } from './generated/synapse/topic/external-odometry-data.js';
 import { ExternalOdometryFlags } from './generated/synapse/topic/external-odometry-flags.js';
 import { ExternalOdometryStatus } from './generated/synapse/topic/external-odometry-status.js';
+import { GnssFixData } from './generated/synapse/topic/gnss-fix-data.js';
+import { GnssFixFlags } from './generated/synapse/topic/gnss-fix-flags.js';
+import { GnssFixType } from './generated/synapse/types/gnss-fix-type.js';
 import { NavigationTargetData } from './generated/synapse/topic/navigation-target-data.js';
 import { LocalPositionCommandData } from './generated/synapse/topic/local-position-command-data.js';
 import { ManualControlData } from './generated/synapse/topic/manual-control-data.js';
@@ -38,6 +41,7 @@ import { MocapPoseFrame } from './generated/synapse/topic/mocap-pose-frame.js';
 import { MocapRawFlags } from './generated/synapse/topic/mocap-raw-flags.js';
 import { PowerStatusData } from './generated/synapse/topic/power-status-data.js';
 import { RawPoseData } from './generated/synapse/topic/raw-pose-data.js';
+import { SensorComponentFlags } from './generated/synapse/topic/sensor-component-flags.js';
 import { PwmSignalOutputsData } from './generated/synapse/topic/pwm-signal-outputs-data.js';
 import { RadioControlData } from './generated/synapse/topic/radio-control-data.js';
 import { TrajectorySegmentData } from './generated/synapse/topic/trajectory-segment-data.js';
@@ -61,6 +65,7 @@ const SCHEMA_BY_TOPIC_NAME: Record<string, string> = {
   MocapPoseFrame: 'MocapPoseFrame',
   ManualControlCommand: 'ManualControl',
   RadioControl: 'RadioControl',
+  GnssFix: 'GnssFix',
   PwmSignalOutputs: 'PwmSignalOutputs',
   AttitudeEstimate: 'AttitudeEstimate',
   AttitudeCommand: 'AttitudeCommand',
@@ -178,6 +183,8 @@ export function decode(key: string, bytes: Uint8Array, encoding?: string | null)
       return decodeOrRaw(schema, bytes, decodeManualControl);
     case 'RadioControl':
       return decodeOrRaw(schema, bytes, decodeRadioControl);
+    case 'GnssFix':
+      return decodeOrRaw(schema, bytes, decodeGnssFix);
     case 'PwmSignalOutputs':
       return decodeOrRaw(schema, bytes, decodePwmSignalOutputs);
     case 'ExternalOdometry':
@@ -384,21 +391,155 @@ function decodeControlLoopMetrics(bytes: Uint8Array): unknown | null {
   };
 }
 
+/** `SensorComponentFlags` bit names, for reporting which components are down. */
+const SENSOR_COMPONENT_NAMES: [number, string][] = [
+  [SensorComponentFlags.Gyro, 'gyro'],
+  [SensorComponentFlags.Accel, 'accel'],
+  [SensorComponentFlags.Mag, 'mag'],
+  [SensorComponentFlags.AbsolutePressure, 'baro'],
+  [SensorComponentFlags.DifferentialPressure, 'airspeed'],
+  [SensorComponentFlags.Gnss, 'gnss'],
+  [SensorComponentFlags.OpticalFlow, 'optical flow'],
+  [SensorComponentFlags.VisionPosition, 'vision'],
+  [SensorComponentFlags.Rangefinder, 'rangefinder'],
+  [SensorComponentFlags.RadioControl, 'rc'],
+  [SensorComponentFlags.MotorOutputs, 'motors'],
+  [SensorComponentFlags.Battery, 'battery'],
+  [SensorComponentFlags.Estimator, 'estimator'],
+  [SensorComponentFlags.Logging, 'logging'],
+  [SensorComponentFlags.CommandLink, 'command link'],
+  [SensorComponentFlags.Terrain, 'terrain']
+];
+
+function sensorComponentNames(mask: number): string[] {
+  return SENSOR_COMPONENT_NAMES.filter(([bit]) => hasFlag(mask, bit)).map(([, name]) => name);
+}
+
+/**
+ * Decode a `health` (VehicleHealth) struct.
+ *
+ * The sensor bitmasks are the authoritative health signal: a component that is
+ * enabled but missing from `sensors_health` has failed, and some producers
+ * report that while never setting the `Failsafe` flag at all. Battery and load
+ * are returned as `null` unless the vehicle actually reports those subsystems,
+ * because a producer with no battery monitor leaves the fields at zero, which
+ * would otherwise render as a flat pack rather than as no data.
+ */
 function decodeVehicleHealth(bytes: Uint8Array): unknown | null {
   const data = new VehicleHealthData().__init(0, byteBuffer(bytes));
   const flags = data.flags();
+  const present = data.sensorsPresent();
+  const enabled = data.sensorsEnabled();
+  const health = data.sensorsHealth();
+  const unhealthy = enabled & ~health;
+  const batteryPresent = hasFlag(present, SensorComponentFlags.Battery);
+  const loadDpermille = data.loadDpermille();
+
   return {
     data: {
       timestamp_us: Number(data.timestampUs()),
       flight_mode: data.flightMode(),
       link_quality_pct: data.linkQualityPct(),
-      voltage_battery_v: data.voltageBatteryCv() / 100,
-      current_battery_a: data.currentBatteryDa() / 10,
-      battery_remaining_pct: data.batteryRemainingPct(),
+      sensors_present: present,
+      sensors_enabled: enabled,
+      sensors_health: health,
+      unhealthy_sensors: sensorComponentNames(unhealthy),
+      battery_present: batteryPresent,
+      voltage_battery_v: batteryPresent ? data.voltageBatteryCv() / 100 : null,
+      current_battery_a: batteryPresent ? data.currentBatteryDa() / 10 : null,
+      battery_remaining_pct: batteryPresent ? data.batteryRemainingPct() : null,
       armed: hasFlag(flags, VehicleHealthFlags.Armed),
-      failsafe: hasFlag(flags, VehicleHealthFlags.Failsafe),
+      // An enabled-but-unhealthy component is a failsafe condition even when
+      // the producer never raises the flag itself.
+      failsafe: hasFlag(flags, VehicleHealthFlags.Failsafe) || unhealthy !== 0,
+      failsafe_flag: hasFlag(flags, VehicleHealthFlags.Failsafe),
       system_state: data.systemState(),
-      load_pct: data.loadDpermille() / 10
+      // A running vehicle never reports exactly 0.0% load, so treat it as
+      // "not reported" rather than as an idle CPU.
+      load_pct: loadDpermille > 0 ? loadDpermille / 10 : null
+    }
+  };
+}
+
+const GNSS_FIX_TYPE_NAMES: Record<number, string> = {
+  [GnssFixType.NoFix]: 'no fix',
+  [GnssFixType.TimeOnly]: 'time only',
+  [GnssFixType.Fix2d]: '2D',
+  [GnssFixType.Fix3d]: '3D',
+  [GnssFixType.Dgnss]: 'DGNSS',
+  [GnssFixType.RtkFloat]: 'RTK float',
+  [GnssFixType.RtkFixed]: 'RTK fixed',
+  [GnssFixType.DeadReckoning]: 'dead reckoning'
+};
+
+/**
+ * The schema defines 65535 as "at or above 65.535 m, unusable". Producers with
+ * no accuracy estimate saturate rather than truncate, so this is a "no figure
+ * available" sentinel, not a large-but-real one.
+ */
+const UNUSABLE_ACCURACY = 0xffff;
+
+function accuracyOrNull(milli: number): number | null {
+  return milli === UNUSABLE_ACCURACY ? null : milli / 1000;
+}
+
+/**
+ * Decode a `gnss` (GnssFix) struct.
+ *
+ * Every field that a producer may leave unpopulated is returned as `null`
+ * rather than as its zero value, because a zero here is indistinguishable from
+ * a real measurement and would otherwise render as one: 0 m accuracy reads as
+ * perfect, and a zeroed lat/lon plots as a position in the Gulf of Guinea.
+ */
+function decodeGnssFix(bytes: Uint8Array): unknown | null {
+  const data = new GnssFixData().__init(0, byteBuffer(bytes));
+  const flags = data.flags();
+  const fixType = data.fixType();
+  // There is no position-valid flag, and producers publish samples while the
+  // receiver is still acquiring — deliberately, so that "receiver alive, no
+  // lock yet" is distinguishable from "receiver silent". fix_type is the only
+  // signal that the position fields mean anything.
+  const positionValid = fixType >= GnssFixType.Fix2d;
+  const satellitesUsed = data.satellitesUsed();
+  const satellitesVisible = data.satellitesVisible();
+  const hdopCenti = data.hdopCenti();
+  const vdopCenti = data.vdopCenti();
+  const yawValid = hasFlag(flags, GnssFixFlags.YawValid);
+
+  return {
+    data: {
+      timestamp_us: Number(data.timestampUs()),
+      fix_type: fixType,
+      fix_type_name: GNSS_FIX_TYPE_NAMES[fixType] ?? `fix ${fixType}`,
+      position_valid: positionValid,
+      latitude_deg: positionValid ? data.latitudeDegE7() / 1e7 : null,
+      longitude_deg: positionValid ? data.longitudeDegE7() / 1e7 : null,
+      altitude_msl_m: positionValid ? data.altitudeMslMm() / 1000 : null,
+      altitude_ellipsoid_m: positionValid ? data.altitudeEllipsoidMm() / 1000 : null,
+      horizontal_accuracy_m: accuracyOrNull(data.horizontalAccuracyMm()),
+      vertical_accuracy_m: accuracyOrNull(data.verticalAccuracyMm()),
+      velocity_accuracy_mps: accuracyOrNull(data.velocityAccuracyMmS()),
+      // A real fix never has a DOP below 1, so 0 means "not reported".
+      hdop: hdopCenti > 0 ? hdopCenti / 100 : null,
+      vdop: vdopCenti > 0 ? vdopCenti / 100 : null,
+      ground_speed_mps: data.groundSpeedCmS() / 100,
+      course_over_ground_deg: hasFlag(flags, GnssFixFlags.CourseValid)
+        ? data.courseOverGroundCdeg() / 100
+        : null,
+      yaw_deg: yawValid ? data.yawCdeg() / 100 : null,
+      // Gated on YawValid as well: a producer that does not compute heading
+      // leaves the accuracy at 0 instead of saturating it, and 0 would read as
+      // a perfect heading rather than a missing one.
+      yaw_accuracy_deg: yawValid ? data.yawAccuracyCdeg() / 100 : null,
+      velocity_up_mps: hasFlag(flags, GnssFixFlags.VelocityUpValid)
+        ? data.velocityUpCmS() / 100
+        : null,
+      time_unix_us: hasFlag(flags, GnssFixFlags.TimeValid) ? Number(data.timeUnixUs()) : null,
+      satellites_used: satellitesUsed,
+      // Visible can never be below used; a smaller value means the producer
+      // does not report it.
+      satellites_visible: satellitesVisible >= satellitesUsed ? satellitesVisible : null,
+      id: data.id()
     }
   };
 }

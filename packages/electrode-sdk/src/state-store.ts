@@ -9,6 +9,7 @@ import type {
   EventFrame,
   EventMessage,
   GcsFrame,
+  GnssState,
   LinkStatus,
   LocalizationState,
   ManualControlState,
@@ -36,11 +37,14 @@ export function createInitialVehicleState(vehicleId = DEFAULT_VEHICLE_ID): Vehic
     velocity: null,
     attitude: null,
     attitudeEstimate: null,
+    mocapPose: null,
+    mocapAttitude: null,
     controls: null,
     manualControl: null,
     radioControl: null,
     motors: null,
     battery: null,
+    gnss: null,
     link: null,
     mode: {
       name: 'standby',
@@ -301,9 +305,11 @@ function applySynapseFrame(state: VehicleState, frame: TelemetryFrame, nowMs: nu
       state.velocity = velocity;
     }
   } else if (topicName === 'AttitudeEstimate') {
-    applyAttitudeEstimate(state, frame.payload);
+    applyAttitudeEstimate(state, frame.payload, nowMs);
   } else if (topicName === 'VehicleHealth') {
     applyVehicleHealth(state, frame.payload);
+  } else if (topicName === 'GnssFix') {
+    applyGnssFix(state, frame.payload, nowMs);
   } else if (topicName === 'ManualControlCommand') {
     const controls = parseControlInputs(frame.payload);
     if (controls) {
@@ -557,10 +563,14 @@ function applyMocapFrame(
 
   // Indoor mocap has no geodetic fix; xM/yM/altM carry the local ENU pose.
   state.pose = { lat: 0, lon: 0, altM, xM, yM, zM: -altM };
+  // Also kept under its own name: the canonical pose may be owned by another
+  // source, and the 3D view draws mocap and telemetry side by side.
+  state.mocapPose = state.pose;
 
   const attitude = quaternionToEuler(body.attitude as Record<string, unknown> | undefined);
   if (attitude) {
     state.attitude = attitude;
+    state.mocapAttitude = attitude;
   }
 
   const trackingValid = body.tracking_valid !== false;
@@ -601,15 +611,39 @@ function markMocapStale(state: VehicleState, nowMs: number): void {
 }
 
 /**
- * Set estimator attitude from a decoded `att` (AttitudeEstimate). The
- * canonical `state.attitude` remains owned by mocap while tracking is live.
+ * How long mocap keeps ownership of the displayed attitude after its last
+ * sample, so a dropped frame does not flip the display between sources.
  */
-function applyAttitudeEstimate(state: VehicleState, payload: unknown): void {
+const MOCAP_ATTITUDE_HOLD_MS = 1000;
+
+/** True while a mocap source is still supplying the displayed attitude. */
+function mocapOwnsAttitude(state: VehicleState, nowMs: number): boolean {
+  return (
+    state.localization.source.startsWith('mocap') &&
+    state.localization.fresh &&
+    nowMs - state.localization.updatedAtMs < MOCAP_ATTITUDE_HOLD_MS
+  );
+}
+
+/**
+ * Set attitude from a decoded `att` (AttitudeEstimate).
+ *
+ * Mocap keeps ownership of `state.attitude` while it is live, so ground truth
+ * never fights the estimator indoors. Everywhere else — a vehicle on a
+ * telemetry radio has no mocap at all — the estimator *is* the displayed
+ * attitude, and withholding it would leave the HUD and vehicle model frozen
+ * while perfectly good attitude telemetry arrived.
+ */
+function applyAttitudeEstimate(state: VehicleState, payload: unknown, nowMs: number): void {
   const record = payload as Record<string, unknown> | null | undefined;
   const data = (record?.data ?? record) as Record<string, unknown> | undefined;
   const attitude = quaternionToEuler(data?.attitude as Record<string, unknown> | undefined);
-  if (attitude) {
-    state.attitudeEstimate = attitude;
+  if (!attitude) {
+    return;
+  }
+  state.attitudeEstimate = attitude;
+  if (!mocapOwnsAttitude(state, nowMs)) {
+    state.attitude = attitude;
   }
 }
 
@@ -636,13 +670,73 @@ function applyVehicleHealth(state: VehicleState, payload: unknown): void {
     latencyMs: 20 + (100 - quality) * 0.5,
     packetLossPct: 100 - quality
   };
-  // Battery fallback: prefer explicit power_status; a negative remaining_pct
-  // means "unknown", so keep the existing value in that case.
+  // Battery fallback: prefer explicit power_status. The decoder nulls these
+  // fields unless the vehicle reports a Battery component, so a vehicle with no
+  // battery monitor leaves `state.battery` untouched rather than pinning the
+  // gauge to a flat 0 V pack. A negative remaining_pct means "unknown".
+  const voltageV = toFiniteNumber(data.voltage_battery_v);
+  const currentA = toFiniteNumber(data.current_battery_a);
   const remainingPct = toFiniteNumber(data.battery_remaining_pct);
-  state.battery = {
-    voltageV: toFiniteNumber(data.voltage_battery_v) ?? state.battery?.voltageV ?? 0,
-    currentA: toFiniteNumber(data.current_battery_a) ?? state.battery?.currentA ?? 0,
-    remainingPct: remainingPct !== null && remainingPct >= 0 ? remainingPct : state.battery?.remainingPct ?? 0
+  if (voltageV !== null || currentA !== null || remainingPct !== null) {
+    state.battery = {
+      voltageV: voltageV ?? state.battery?.voltageV ?? 0,
+      currentA: currentA ?? state.battery?.currentA ?? 0,
+      remainingPct:
+        remainingPct !== null && remainingPct >= 0 ? remainingPct : state.battery?.remainingPct ?? 0
+    };
+  }
+}
+
+/**
+ * Apply a decoded `gnss` (GnssFix) payload.
+ *
+ * The fix only reaches `state.pose` once the receiver has a 2D lock. The
+ * vehicle deliberately publishes fixes while still acquiring — that is how
+ * "receiver alive, no lock yet" is distinguished from "receiver silent" — and
+ * those samples carry a meaningless latitude and longitude, usually zero, which
+ * would otherwise drop the vehicle marker into the Gulf of Guinea.
+ */
+function applyGnssFix(state: VehicleState, payload: unknown, nowMs: number): void {
+  const record = payload as Record<string, unknown> | null | undefined;
+  const data = (record?.data ?? record) as Record<string, unknown> | undefined;
+  if (!data) {
+    return;
+  }
+
+  const positionValid = Boolean(data.position_valid);
+  const lat = toFiniteNumber(data.latitude_deg);
+  const lon = toFiniteNumber(data.longitude_deg);
+  const altMslM = toFiniteNumber(data.altitude_msl_m);
+  const gnss: GnssState = {
+    fixType: toFiniteNumber(data.fix_type) ?? 0,
+    fixTypeName: typeof data.fix_type_name === 'string' ? data.fix_type_name : 'unknown',
+    positionValid,
+    lat,
+    lon,
+    altMslM,
+    horizontalAccuracyM: toFiniteNumber(data.horizontal_accuracy_m),
+    verticalAccuracyM: toFiniteNumber(data.vertical_accuracy_m),
+    groundSpeedMps: toFiniteNumber(data.ground_speed_mps) ?? 0,
+    courseOverGroundDeg: toFiniteNumber(data.course_over_ground_deg),
+    satellitesUsed: toFiniteNumber(data.satellites_used) ?? 0,
+    satellitesVisible: toFiniteNumber(data.satellites_visible),
+    hdop: toFiniteNumber(data.hdop),
+    updatedAtMs: nowMs
+  };
+  state.gnss = gnss;
+
+  if (!positionValid || lat === null || lon === null) {
+    return;
+  }
+  // GNSS supplies the global fix only; the local frame belongs to whichever
+  // source owns it (mocap, or the estimator), so it is carried through.
+  state.pose = {
+    lat,
+    lon,
+    altM: altMslM ?? state.pose?.altM ?? 0,
+    xM: state.pose?.xM ?? 0,
+    yM: state.pose?.yM ?? 0,
+    zM: state.pose?.zM ?? 0
   };
 }
 

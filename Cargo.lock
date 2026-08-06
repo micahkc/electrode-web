@@ -784,6 +784,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "electrode-telemetry-bridge"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "flatbuffers",
+ "serialport",
+ "synapse_fbs",
+ "thiserror 2.0.18",
+ "zenoh",
+]
+
+[[package]]
 name = "electrode-web-core"
 version = "0.1.0"
 dependencies = [

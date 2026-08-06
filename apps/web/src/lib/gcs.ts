@@ -153,6 +153,127 @@ export async function setPpmBridgeRunning(running: boolean): Promise<BridgeStatu
   return (await response.json()) as BridgeStatus;
 }
 
+/** Telemetry-radio link settings. */
+export interface TelemetryProfile {
+  serialDevice: string;
+  baudRate: number;
+  /** Convert mocap pose to GnssFix and send it up the radio. */
+  mocapGnss: boolean;
+  mocapNamespace: string;
+  namespace: string;
+  /** Geodetic origin the mocap frame is pinned to. */
+  originLat: number;
+  originLon: number;
+  originAlt: number;
+  /** Degrees the uplink rotates the facility frame onto true north. */
+  yawOffsetDeg: number;
+}
+
+export interface TelemetryStatus {
+  running: boolean;
+  bin: string;
+  profile: TelemetryProfile;
+}
+
+export async function fetchTelemetryStatus(signal?: AbortSignal): Promise<TelemetryStatus> {
+  const response = await fetch(gcsUrl('telemetry'), { signal });
+  if (!response.ok) {
+    throw new Error(`gcs/telemetry responded ${response.status}`);
+  }
+  return (await response.json()) as TelemetryStatus;
+}
+
+/** Replace the telemetry profile; a running bridge is relaunched to apply it. */
+export async function saveTelemetryProfile(profile: TelemetryProfile): Promise<TelemetryStatus> {
+  const response = await fetch(gcsUrl('telemetry'), {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(profile)
+  });
+  if (!response.ok) {
+    throw new Error(`gcs/telemetry save failed (${response.status})`);
+  }
+  return (await response.json()) as TelemetryStatus;
+}
+
+export async function setTelemetryRunning(running: boolean): Promise<TelemetryStatus> {
+  const response = await fetch(gcsUrl(running ? 'telemetry/start' : 'telemetry/stop'), {
+    method: 'POST'
+  });
+  if (!response.ok) {
+    throw new Error(`telemetry bridge ${running ? 'start' : 'stop'} failed (${response.status})`);
+  }
+  return (await response.json()) as TelemetryStatus;
+}
+
+/**
+ * Toggle the mocap GNSS uplink. The radio's serial port cannot be shared, so
+ * this relaunches the one bridge process and telemetry drops for that moment.
+ */
+export async function setMocapGnssEnabled(enabled: boolean): Promise<TelemetryStatus> {
+  const response = await fetch(gcsUrl('telemetry/mocap-gnss'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled })
+  });
+  if (!response.ok) {
+    throw new Error(`mocap gnss toggle failed (${response.status})`);
+  }
+  return (await response.json()) as TelemetryStatus;
+}
+
+/**
+ * The LAN link to the motion-capture machine. Mocap does not come over the
+ * telemetry radio: a capture system publishes it on its own Zenoh router and
+ * the ground station subscribes across the network.
+ */
+export interface MocapStatus {
+  /** Address as stored, in whatever form it was typed. */
+  address: string;
+  /** Zenoh locator it resolves to, showing the filled-in transport and port. */
+  endpoint: string | null;
+  /**
+   * Something is answering on the far end right now. A configured address that
+   * is not connected is a capture machine that is off, unreachable, or has
+   * dropped since the link was opened.
+   */
+  connected: boolean;
+  peers: number;
+  error: string | null;
+}
+
+export async function fetchMocapStatus(signal?: AbortSignal): Promise<MocapStatus> {
+  const response = await fetch(gcsUrl('mocap'), { signal });
+  if (!response.ok) {
+    throw new Error(`gcs/mocap responded ${response.status}`);
+  }
+  // A daemon too old to know this route serves the SPA fallback instead, which
+  // is a 200 full of HTML. Left to `response.json()` that surfaces as an opaque
+  // parse error, so name the real cause: the daemon needs restarting.
+  const type = response.headers.get('content-type') ?? '';
+  if (!type.includes('json')) {
+    throw new Error('gcs/mocap is not served by this daemon — restart it to pick up the mocap link');
+  }
+  return (await response.json()) as MocapStatus;
+}
+
+/** Repoint the mocap link at a capture machine; applied in place, no restart. */
+export async function saveMocapAddress(address: string): Promise<MocapStatus> {
+  const response = await fetch(gcsUrl('mocap'), {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ address })
+  });
+  if (!response.ok) {
+    throw new Error(`gcs/mocap save failed (${response.status})`);
+  }
+  const type = response.headers.get('content-type') ?? '';
+  if (!type.includes('json')) {
+    throw new Error('gcs/mocap is not served by this daemon — restart it to pick up the mocap link');
+  }
+  return (await response.json()) as MocapStatus;
+}
+
 /** Live state of the daemon-supervised native autopilot (cubs2 native_sim + Zenoh link). */
 export interface AutopilotRunStatus {
   running: boolean;
