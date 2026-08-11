@@ -465,3 +465,40 @@ describe('VehicleHealth decoder', () => {
     expect(data.unhealthy_sensors).toEqual([]);
   });
 });
+
+describe('InertialSample decoding', () => {
+  it('decodes a bare InertialSampleData struct and drops absent fields', () => {
+    // Layout of synapse.topic.InertialSampleData (56 bytes): u64 timestamp_us,
+    // Vec3f accel, Vec3f gyro, Vec3f mag, f32 pressure, f32 temperature,
+    // u8 flags, u8 id. The vehicle only marks Accel|Gyro present.
+    const bytes = new Uint8Array(56);
+    const view = new DataView(bytes.buffer);
+    view.setBigUint64(0, 123_456n, true);
+    view.setFloat32(8, 0.1, true);
+    view.setFloat32(12, -0.2, true);
+    view.setFloat32(16, 9.81, true);
+    view.setFloat32(20, 0.01, true);
+    view.setFloat32(24, -0.02, true);
+    view.setFloat32(28, 0.03, true);
+    bytes[52] = 0b0000_0011; // InertialFieldFlags Accel | Gyro
+    bytes[53] = 1;
+
+    const topic = parseKey('imu')!.topic;
+    const decoded = decode('imu', bytes, expectedTopicEncoding(topic));
+
+    expect(decoded.schema).toBe('InertialSample');
+    expect(decoded.decoded).toBe(true);
+    const payload = decoded.payload as {
+      data: {
+        timestamp_us: number;
+        accel: { z: number } | null;
+        gyro: { x: number } | null;
+        id: number;
+      };
+    };
+    expect(payload.data.timestamp_us).toBe(123_456);
+    expect(payload.data.accel?.z).toBeCloseTo(9.81);
+    expect(payload.data.gyro?.x).toBeCloseTo(0.01);
+    expect(payload.data.id).toBe(1);
+  });
+});
