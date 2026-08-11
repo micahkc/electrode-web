@@ -23,6 +23,8 @@ import * as flatbuffers from 'flatbuffers';
 
 import { AttitudeCommandData } from './generated/synapse/topic/attitude-command-data.js';
 import { AttitudeEstimateData } from './generated/synapse/topic/attitude-estimate-data.js';
+import { InertialFieldFlags } from './generated/synapse/topic/inertial-field-flags.js';
+import { InertialSampleData } from './generated/synapse/topic/inertial-sample-data.js';
 import { AttitudeEstimateFlags } from './generated/synapse/topic/attitude-estimate-flags.js';
 import { ControlLoopMetricsData } from './generated/synapse/topic/control-loop-metrics-data.js';
 import { ExternalOdometryData } from './generated/synapse/topic/external-odometry-data.js';
@@ -69,6 +71,7 @@ const SCHEMA_BY_TOPIC_NAME: Record<string, string> = {
   PwmSignalOutputs: 'PwmSignalOutputs',
   AttitudeEstimate: 'AttitudeEstimate',
   AttitudeCommand: 'AttitudeCommand',
+  InertialSample: 'InertialSample',
   NavigationTarget: 'NavigationTarget',
   ControlLoopMetrics: 'ControlLoopMetrics',
   VehicleHealth: 'VehicleHealth',
@@ -169,6 +172,8 @@ export function decode(key: string, bytes: Uint8Array, encoding?: string | null)
   switch (schema) {
     case 'AttitudeEstimate':
       return decodeOrRaw(schema, bytes, decodeAttitudeEstimate);
+    case 'InertialSample':
+      return decodeOrRaw(schema, bytes, decodeInertialSample);
     case 'AttitudeCommand':
       return decodeOrRaw(schema, bytes, decodeAttitudeCommand);
     case 'NavigationTarget':
@@ -339,6 +344,31 @@ function decodeAttitudeEstimate(bytes: Uint8Array): unknown | null {
       angular_velocity: { roll: rates.roll(), pitch: rates.pitch(), yaw: rates.yaw() },
       attitude_valid: hasFlag(flags, AttitudeEstimateFlags.AttitudeValid),
       rates_valid: hasFlag(flags, AttitudeEstimateFlags.RatesValid)
+    }
+  };
+}
+
+/** Raw IMU stream for tuning: gyro/accel exactly as the control loop saw
+ * them, body FLU, SI units. Fields the vehicle marks absent decode as null
+ * so plots do not chart uninitialized zeroes. */
+function decodeInertialSample(bytes: Uint8Array): unknown | null {
+  const data = new InertialSampleData().__init(0, byteBuffer(bytes));
+  const accel = data.accelFluMS2();
+  const gyro = data.gyroFluRadS();
+  if (!accel || !gyro) {
+    return null;
+  }
+  const flags = data.flags();
+  return {
+    data: {
+      timestamp_us: Number(data.timestampUs()),
+      accel: hasFlag(flags, InertialFieldFlags.Accel)
+        ? { x: accel.x(), y: accel.y(), z: accel.z() }
+        : null,
+      gyro: hasFlag(flags, InertialFieldFlags.Gyro)
+        ? { x: gyro.x(), y: gyro.y(), z: gyro.z() }
+        : null,
+      id: data.id()
     }
   };
 }
