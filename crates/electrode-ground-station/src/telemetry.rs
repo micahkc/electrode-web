@@ -8,9 +8,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How the bridge reaches the vehicle: the telemetry radio's serial port, or
+/// UDP to a WiFi bridge (the micro-quad's ESP32) carrying the same framing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LinkMode {
+    #[default]
+    Serial,
+    Udp,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TelemetryProfile {
+    #[serde(default)]
+    pub link_mode: LinkMode,
+    /// UDP address of the vehicle's WiFi bridge (link_mode = udp).
+    #[serde(default = "default_udp_address")]
+    pub udp_address: String,
+    /// Frame the Zenoh `manual` topic up the link as RC (link_mode = udp).
+    #[serde(default)]
+    pub manual_uplink: bool,
     pub serial_device: String,
     pub baud_rate: u32,
     /// Convert mocap pose to GnssFix and send it up the radio.
@@ -29,9 +47,18 @@ pub(crate) struct TelemetryProfile {
     pub yaw_offset_deg: f64,
 }
 
+/// The ESP32 bridge's access-point address and port.
+fn default_udp_address() -> String {
+    std::env::var("ELECTRODE_TELEMETRY_UDP_ADDRESS")
+        .unwrap_or_else(|_| "192.168.4.1:14550".to_string())
+}
+
 impl Default for TelemetryProfile {
     fn default() -> Self {
         Self {
+            link_mode: LinkMode::Serial,
+            udp_address: default_udp_address(),
+            manual_uplink: false,
             serial_device: std::env::var("ELECTRODE_TELEMETRY_SERIAL_DEVICE")
                 .unwrap_or_else(|_| "/dev/ttyUSB0".to_string()),
             baud_rate: 57_600,
@@ -51,12 +78,21 @@ impl TelemetryProfile {
     /// deliberately left to the bridge's own defaults, which are the values the
     /// vehicle tree's scripts were trimmed against.
     pub(crate) fn bridge_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "--serial-device".to_string(),
-            self.serial_device.clone(),
-            "--baud-rate".to_string(),
-            self.baud_rate.to_string(),
-        ];
+        let mut args = match self.link_mode {
+            LinkMode::Serial => vec![
+                "--serial-device".to_string(),
+                self.serial_device.clone(),
+                "--baud-rate".to_string(),
+                self.baud_rate.to_string(),
+            ],
+            LinkMode::Udp => {
+                let mut args = vec!["--udp-address".to_string(), self.udp_address.clone()];
+                if self.manual_uplink {
+                    args.push("--manual-uplink".to_string());
+                }
+                args
+            }
+        };
         if !self.namespace.trim_matches('/').is_empty() {
             args.push("--namespace".to_string());
             args.push(self.namespace.clone());
@@ -135,5 +171,41 @@ mod tests {
         let args = TelemetryProfile::default().bridge_args();
 
         assert!(!args.contains(&"--namespace".to_string()));
+    }
+
+    #[test]
+    fn udp_mode_swaps_the_transport_flags() {
+        let profile = TelemetryProfile {
+            link_mode: LinkMode::Udp,
+            udp_address: "192.168.4.1:14550".to_string(),
+            manual_uplink: true,
+            ..TelemetryProfile::default()
+        };
+
+        let args = profile.bridge_args();
+
+        let index = args.iter().position(|arg| arg == "--udp-address");
+        assert_eq!(
+            args.get(index.expect("flag") + 1),
+            Some(&"192.168.4.1:14550".to_string())
+        );
+        assert!(args.contains(&"--manual-uplink".to_string()));
+        assert!(!args.contains(&"--serial-device".to_string()));
+        assert!(!args.contains(&"--baud-rate".to_string()));
+    }
+
+    /// Old persisted profiles predate the link fields; they must deserialize
+    /// as serial rather than fail.
+    #[test]
+    fn profiles_without_link_fields_default_to_serial() {
+        let profile: TelemetryProfile = serde_json::from_str(
+            r#"{"serialDevice":"/dev/ttyUSB1","baudRate":57600,"mocapGnss":false,
+                "mocapNamespace":"**","namespace":"","originLat":0.0,"originLon":0.0,
+                "originAlt":0.0,"yawOffsetDeg":0.0}"#,
+        )
+        .expect("deserialize");
+
+        assert_eq!(profile.link_mode, LinkMode::Serial);
+        assert!(!profile.manual_uplink);
     }
 }

@@ -149,7 +149,26 @@ topic follows:
 | `-S mocap-gnss` | inbound | GNSS must be supplied; none is telemetered |
 
 The uplink set in the default build is `ManualControlCommand` (id 4) and
-`InertialSample` (id 5, simulation only); neither is wired here.
+`InertialSample` (id 5, simulation only). Manual control is wired for UDP
+links only — see below; inertial injection is not wired here.
+
+## UDP Link Mode (WiFi bridge)
+
+`--udp-address HOST:PORT` (or `TELEMETRY_UDP_ADDRESS`) replaces the serial
+port with a connected UDP socket, for vehicles whose "radio" is a transparent
+UART↔UDP WiFi bridge such as the micro-quad's ESP32 access point
+(`192.168.4.1:14550` by default). The framing is identical; the decoder does
+not care what carries the bytes.
+
+Because a UDP socket, unlike a serial port, can be shared across threads,
+`--manual-uplink` additionally subscribes to the Zenoh `manual` topic (bare
+`ManualControlData`, already policy-gated by the command authority) and
+frames each sample up the link as RC, transmitted directly from the
+subscriber callback for minimum latency. The vehicle side needs
+`CONFIG_RDD2_RC_SYNAPSE`; its RC staleness failsafe expects a steady stream,
+so keep the joystick bridge or the browser's virtual transmitter running
+while armed. `--manual-uplink` is refused on serial links, where RC is the
+CRSF/PPM path.
 
 ## Mocap GNSS Uplink
 

@@ -611,22 +611,40 @@
       if (!telemetryDeviceDirty) {
         telemetryDevice = status.profile.serialDevice;
       }
+      if (!telemetryLinkDirty) {
+        telemetryLinkMode = status.profile.linkMode ?? 'serial';
+        telemetryUdpAddress = status.profile.udpAddress ?? '';
+        telemetryManualUplink = status.profile.manualUplink ?? false;
+      }
     } catch {
       // The daemon may not expose telemetry yet; leave the last known state.
     }
   }
 
   let telemetryDeviceDirty = false;
+  let telemetryLinkDirty = false;
+  let telemetryLinkMode: 'serial' | 'udp' = 'serial';
+  let telemetryUdpAddress = '';
+  let telemetryManualUplink = false;
 
-  /** Apply the typed serial device, then start or stop the telemetry bridge. */
+  function telemetryLinkLabel(profile: TelemetryProfile): string {
+    return profile.linkMode === 'udp'
+      ? `WiFi link ${profile.udpAddress}${profile.manualUplink ? ' + RC' : ''}`
+      : `radio on ${profile.serialDevice}`;
+  }
+
+  /** Apply the edited link settings, then start or stop the telemetry bridge. */
   async function toggleTelemetry(): Promise<void> {
     if (telemetryBusy) return;
     telemetryBusy = true;
     try {
-      if (telemetryProfile && telemetryDevice.trim() && telemetryDevice !== telemetryProfile.serialDevice) {
+      if (telemetryProfile && (telemetryDeviceDirty || telemetryLinkDirty)) {
         const saved = await saveTelemetryProfile({
           ...telemetryProfile,
-          serialDevice: telemetryDevice.trim()
+          linkMode: telemetryLinkMode,
+          udpAddress: telemetryUdpAddress.trim() || telemetryProfile.udpAddress,
+          manualUplink: telemetryManualUplink,
+          serialDevice: telemetryDevice.trim() || telemetryProfile.serialDevice
         });
         telemetryProfile = saved.profile;
       }
@@ -634,9 +652,10 @@
       telemetryRunning = status.running;
       telemetryProfile = status.profile;
       telemetryDeviceDirty = false;
+      telemetryLinkDirty = false;
       manualBridgeStatus = status.running
-        ? `telemetry radio on ${status.profile.serialDevice}`
-        : 'telemetry radio stopped';
+        ? `telemetry ${telemetryLinkLabel(status.profile)}`
+        : 'telemetry link stopped';
     } catch (error) {
       manualBridgeStatus = error instanceof Error ? error.message : 'telemetry toggle failed';
     } finally {
@@ -1488,13 +1507,46 @@
         <div class="panel-heading">
           <div>
             <h2>Telemetry Link</h2>
-            <p>{telemetryRunning ? `radio on ${telemetryProfile?.serialDevice ?? ''}` : 'radio stopped'}</p>
+            <p>{telemetryRunning && telemetryProfile ? telemetryLinkLabel(telemetryProfile) : 'link stopped'}</p>
           </div>
           <Radio size={20} />
         </div>
 
         {#if $isGroundStation}
           <div class="telemetry-controls">
+          <select
+            class="telemetry-device"
+            bind:value={telemetryLinkMode}
+            onchange={() => (telemetryLinkDirty = true)}
+            title="Radio: SiK telemetry radio on a serial port. WiFi: UDP to the vehicle's ESP32
+bridge, carrying the same framing, with optional RC uplink."
+          >
+            <option value="serial">Radio (serial)</option>
+            <option value="udp">WiFi (UDP)</option>
+          </select>
+          {#if telemetryLinkMode === 'udp'}
+            <input
+              class="telemetry-device"
+              type="text"
+              bind:value={telemetryUdpAddress}
+              oninput={() => (telemetryLinkDirty = true)}
+              placeholder="192.168.4.1:14550"
+              title="UDP address of the vehicle's WiFi bridge (the ESP32 access point)"
+            />
+            <label
+              class="telemetry-manual-uplink"
+              title="Send the manual topic up the link as RC. The vehicle must be built with
+CONFIG_RDD2_RC_SYNAPSE; its staleness failsafe expects a steady stream, so keep the
+joystick bridge or virtual transmitter running while armed."
+            >
+              <input
+                type="checkbox"
+                bind:checked={telemetryManualUplink}
+                onchange={() => (telemetryLinkDirty = true)}
+              />
+              <span>WiFi RC</span>
+            </label>
+          {:else}
           <input
             class="telemetry-device"
             type="text"
@@ -1510,6 +1562,7 @@ ttyUSB numbering can swap between boots when more than one adapter is attached."
               <option value={device.path}>{device.name}</option>
             {/each}
           </datalist>
+          {/if}
           <button
             type="button"
             class="icon-button"

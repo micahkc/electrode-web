@@ -24,6 +24,8 @@ use electrode_telemetry_bridge::mocap_gnss::{
     decode_covariance, decode_external_odometry, mark_stale, sample_to_fix, Origin, PoseSample,
     PrevSend, UplinkConfig,
 };
+use electrode_telemetry_bridge::link::{is_idle, Link, UdpLink};
+use electrode_telemetry_bridge::manual_uplink::ManualUplink;
 use electrode_telemetry_bridge::{
     encode_frame, route, FrameDecoder, LinkCounters, Route, RouteError, DEFAULT_BAUD,
 };
@@ -81,6 +83,25 @@ struct Cli {
         help = "Read timeout. A timeout is normal: topics are only sent when they change"
     )]
     serial_timeout_ms: u64,
+
+    #[arg(
+        long = "udp-address",
+        env = "TELEMETRY_UDP_ADDRESS",
+        value_name = "ADDR",
+        help = "Use UDP to the vehicle's WiFi bridge instead of a serial device, e.g. \
+                192.168.4.1:14550 (the micro-quad ESP32 access point). Carries the identical \
+                synapse serial framing"
+    )]
+    udp_address: Option<String>,
+
+    #[arg(
+        long = "manual-uplink",
+        env = "TELEMETRY_MANUAL_UPLINK",
+        help = "Frame the Zenoh `manual` topic (bare ManualControlData) up the link as RC. \
+                Requires --udp-address: a serial radio's port cannot be shared with the read \
+                loop, and those vehicles take RC over CRSF/PPM"
+    )]
+    manual_uplink: bool,
 
     #[arg(
         long = "zenoh-connect",
@@ -267,6 +288,11 @@ enum BridgeError {
     SerialRead(#[from] std::io::Error),
     #[error("--mocap-gnss needs a zenoh session to read mocap pose from; drop --no-zenoh")]
     UplinkNeedsZenoh,
+    #[error("--manual-uplink needs --udp-address (serial radios take RC over CRSF/PPM) and a \
+             zenoh session to read `manual` from")]
+    ManualUplinkNeedsUdp,
+    #[error("the synapse catalog has no `manual` topic; regenerate synapse_fbs")]
+    ManualTopicMissing,
 }
 
 type Result<T> = std::result::Result<T, BridgeError>;
@@ -275,19 +301,44 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     zenoh::init_log_from_env_or("error");
 
-    let mut port = serialport::new(&cli.serial_device, cli.baud_rate)
-        .timeout(Duration::from_millis(cli.serial_timeout_ms))
-        .open()?;
-    print_startup(&cli);
+    if cli.manual_uplink && (cli.udp_address.is_none() || cli.no_zenoh) {
+        return Err(BridgeError::ManualUplinkNeedsUdp);
+    }
 
+    match &cli.udp_address {
+        Some(address) => {
+            let mut link =
+                UdpLink::connect(address, Duration::from_millis(cli.serial_timeout_ms))
+                    .map_err(BridgeError::SerialRead)?;
+            let sender = link.sender().map_err(BridgeError::SerialRead)?;
+            print_startup(&cli);
+            run_with_link(&cli, &mut link, Some(&sender))
+        }
+        None => {
+            let mut port = serialport::new(&cli.serial_device, cli.baud_rate)
+                .timeout(Duration::from_millis(cli.serial_timeout_ms))
+                .open()?;
+            print_startup(&cli);
+            run_with_link(&cli, &mut *port, None)
+        }
+    }
+}
+
+/// Everything after the link exists: identical for serial and UDP apart from
+/// the manual-control uplink, which needs a cloneable socket.
+fn run_with_link<L: Link + ?Sized>(
+    cli: &Cli,
+    link: &mut L,
+    manual_socket: Option<&std::net::UdpSocket>,
+) -> Result<()> {
     if cli.no_zenoh {
         if cli.uplink.mocap_gnss {
             return Err(BridgeError::UplinkNeedsZenoh);
         }
-        return run_loop(&cli, &mut *port, &mut NullSink, None);
+        return run_loop(cli, link, &mut NullSink, None, None);
     }
 
-    let session = open_session(&cli)?;
+    let session = open_session(cli)?;
     // Subscribers are kept alive for the run; the callbacks feed `inbox`.
     let (inbox, _subscribers) = if cli.uplink.mocap_gnss {
         let inbox = Arc::new(Mutex::new(MocapInbox::default()));
@@ -298,11 +349,28 @@ fn main() -> Result<()> {
     };
     let mut uplink = inbox.map(|inbox| Uplink::new(&cli.uplink, inbox));
 
+    // RC uplink: each `manual` sample is framed and transmitted straight from
+    // the subscriber callback; the read loop below never touches it.
+    let (manual, _manual_subscriber) = match (cli.manual_uplink, manual_socket) {
+        (true, Some(socket)) => {
+            let manual = ManualUplink::new(socket.try_clone().map_err(BridgeError::SerialRead)?)
+                .ok_or(BridgeError::ManualTopicMissing)?;
+            let callback_manual = Arc::clone(&manual);
+            let subscriber = session
+                .declare_subscriber("manual")
+                .callback(move |sample| callback_manual.forward(&sample.payload().to_bytes()))
+                .wait()
+                .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+            (Some(manual), Some(subscriber))
+        }
+        _ => (None, None),
+    };
+
     let mut sink = ZenohSink {
         session: &session,
         publishers: HashMap::new(),
     };
-    run_loop(&cli, &mut *port, &mut sink, uplink.as_mut())
+    run_loop(cli, link, &mut sink, uplink.as_mut(), manual.as_deref())
 }
 
 /// Latest mocap sample and accuracy, filled by the subscriber callbacks.
@@ -527,11 +595,12 @@ struct Stats {
     gnss_note_printed: bool,
 }
 
-fn run_loop(
+fn run_loop<L: Link + ?Sized>(
     cli: &Cli,
-    port: &mut dyn serialport::SerialPort,
+    port: &mut L,
     sink: &mut dyn FrameSink,
     mut uplink: Option<&mut Uplink>,
+    manual: Option<&ManualUplink>,
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     let mut stats = Stats::default();
@@ -547,7 +616,7 @@ fn run_loop(
             // that never updates is never sent. It is also what paces this
             // loop, so the uplink below runs on the same thread as the read
             // and the port never needs a lock.
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) if is_idle(error.kind()) => {}
             Err(error) => return Err(BridgeError::SerialRead(error)),
         }
 
@@ -560,9 +629,24 @@ fn run_loop(
         if cli.status_interval_secs > 0 && Instant::now() >= next_status {
             print_status(cli, &decoder.counters(), &mut stats);
             print_uplink_status(uplink.as_deref());
+            print_manual_status(manual);
             next_status = Instant::now() + status_interval;
         }
     }
+}
+
+/// The manual uplink transmits from the Zenoh callback; this only reports it.
+fn print_manual_status(manual: Option<&ManualUplink>) {
+    use std::sync::atomic::Ordering;
+
+    let Some(manual) = manual else {
+        return;
+    };
+    println!(
+        "tx  manual sent={} rejected={}",
+        manual.sent.load(Ordering::Relaxed),
+        manual.rejected.load(Ordering::Relaxed)
+    );
 }
 
 /// The vehicle never acknowledges an injected fix, so the only honest report is
@@ -681,10 +765,16 @@ fn maybe_note_absent_gnss(stats: &mut Stats) {
 }
 
 fn print_startup(cli: &Cli) {
-    println!(
-        "electrode-telemetry-bridge: {} @ {} baud",
-        cli.serial_device, cli.baud_rate
-    );
+    match &cli.udp_address {
+        Some(address) => println!(
+            "electrode-telemetry-bridge: udp {address}{}",
+            if cli.manual_uplink { " (manual uplink on)" } else { "" }
+        ),
+        None => println!(
+            "electrode-telemetry-bridge: {} @ {} baud",
+            cli.serial_device, cli.baud_rate
+        ),
+    }
     if cli.no_zenoh {
         println!("  publishing disabled (--no-zenoh)");
     } else {

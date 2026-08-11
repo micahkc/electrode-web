@@ -155,6 +155,12 @@ export async function setPpmBridgeRunning(running: boolean): Promise<BridgeStatu
 
 /** Telemetry-radio link settings. */
 export interface TelemetryProfile {
+  /** 'serial' = telemetry radio, 'udp' = WiFi bridge (micro-quad ESP32). */
+  linkMode: 'serial' | 'udp';
+  /** UDP address of the vehicle's WiFi bridge (linkMode = 'udp'). */
+  udpAddress: string;
+  /** Frame the `manual` topic up the link as RC (linkMode = 'udp'). */
+  manualUplink: boolean;
   serialDevice: string;
   baudRate: number;
   /** Convert mocap pose to GnssFix and send it up the radio. */

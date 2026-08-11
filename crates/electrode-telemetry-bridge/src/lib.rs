@@ -26,6 +26,8 @@
 //! The reference implementation this is checked against is
 //! `tools/synapse_serial/synapse_serial.py` in the vehicle tree.
 
+pub mod link;
+pub mod manual_uplink;
 pub mod mocap_gnss;
 
 use synapse_fbs::topic_catalog::{self, TopicInfo};
