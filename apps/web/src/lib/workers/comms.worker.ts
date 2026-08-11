@@ -293,6 +293,15 @@ function refreshRuntimeParameters(names: string[]): void {
 }
 
 function handleRawSample(key: string, payload: Uint8Array): void {
+  if (key === 'gcs/v1/status/telemetry-link') {
+    try {
+      const diag = JSON.parse(new TextDecoder().decode(payload)) as Record<string, unknown>;
+      ctx.postMessage({ type: 'telemetryLinkDiag', diag });
+    } catch {
+      // A malformed diagnostics sample is not worth surfacing.
+    }
+    return;
+  }
   if (key !== 'gcs/v1/status/reply/parameters') return;
   try {
     const parameter = decodeRuntimeParameterReply(payload);

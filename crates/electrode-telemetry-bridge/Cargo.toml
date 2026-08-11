@@ -20,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 flatbuffers.workspace = true
+serde_json.workspace = true
 serialport.workspace = true
 synapse_fbs.workspace = true
 thiserror.workspace = true

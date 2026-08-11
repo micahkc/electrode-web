@@ -789,6 +789,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "flatbuffers",
+ "serde_json",
  "serialport",
  "synapse_fbs",
  "thiserror 2.0.18",

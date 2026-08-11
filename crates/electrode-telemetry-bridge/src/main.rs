@@ -335,7 +335,7 @@ fn run_with_link<L: Link + ?Sized>(
         if cli.uplink.mocap_gnss {
             return Err(BridgeError::UplinkNeedsZenoh);
         }
-        return run_loop(cli, link, &mut NullSink, None, None);
+        return run_loop(cli, link, &mut NullSink, None, None, None);
     }
 
     let session = open_session(cli)?;
@@ -366,11 +366,19 @@ fn run_with_link<L: Link + ?Sized>(
         _ => (None, None),
     };
 
+    let diag = DiagPublisher::declare(&session, cli)?;
     let mut sink = ZenohSink {
         session: &session,
         publishers: HashMap::new(),
     };
-    run_loop(cli, link, &mut sink, uplink.as_mut(), manual.as_deref())
+    run_loop(
+        cli,
+        link,
+        &mut sink,
+        uplink.as_mut(),
+        manual.as_deref(),
+        Some(diag),
+    )
 }
 
 /// Latest mocap sample and accuracy, filled by the subscriber callbacks.
@@ -584,6 +592,87 @@ impl FrameSink for ZenohSink<'_> {
     }
 }
 
+/// GCS-side key the link diagnostics are published on, as JSON at 1 Hz. Not
+/// a synapse topic: this is ground-station introspection of the link itself,
+/// so it deliberately stays outside the vehicle's pinned catalog.
+const DIAG_KEY: &str = "gcs/v1/status/telemetry-link";
+
+/// Publishes the decoder's counters, the per-topic tallies, and the manual
+/// uplink's counters for the web UI's link-diagnostics panel.
+struct DiagPublisher<'a> {
+    publisher: Publisher<'a>,
+    transport: &'static str,
+    target: String,
+    started: Instant,
+    next: Instant,
+    last_frames: u64,
+}
+
+impl<'a> DiagPublisher<'a> {
+    fn declare(session: &'a Session, cli: &Cli) -> Result<Self> {
+        let publisher = session
+            .declare_publisher(DIAG_KEY)
+            .encoding(zenoh::bytes::Encoding::APPLICATION_JSON)
+            .wait()
+            .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+        let (transport, target) = match &cli.udp_address {
+            Some(address) => ("udp", address.clone()),
+            None => ("serial", format!("{} @ {}", cli.serial_device, cli.baud_rate)),
+        };
+        Ok(Self {
+            publisher,
+            transport,
+            target,
+            started: Instant::now(),
+            next: Instant::now(),
+            last_frames: 0,
+        })
+    }
+
+    fn tick(&mut self, counters: &LinkCounters, stats: &Stats, manual: Option<&ManualUplink>) {
+        use std::sync::atomic::Ordering;
+
+        let now = Instant::now();
+        if now < self.next {
+            return;
+        }
+        self.next = now + Duration::from_secs(1);
+
+        let frame_rate = counters.frames.saturating_sub(self.last_frames);
+        self.last_frames = counters.frames;
+
+        let per_topic: serde_json::Map<String, serde_json::Value> = stats
+            .per_topic
+            .iter()
+            .map(|(key, count)| ((*key).to_string(), serde_json::Value::from(*count)))
+            .collect();
+        let diag = serde_json::json!({
+            "transport": self.transport,
+            "target": self.target,
+            "upSeconds": self.started.elapsed().as_secs(),
+            "frames": counters.frames,
+            "frameRateHz": frame_rate,
+            "crcErrors": counters.crc_errors,
+            "badLength": counters.bad_len,
+            "resyncs": counters.resyncs,
+            "seqGaps": counters.seq_gaps,
+            "dropped": counters.dropped,
+            "unknownTopic": stats.unknown,
+            "sizeErrors": stats.size_errors,
+            "lastFrameAgeMs": stats
+                .last_frame
+                .map(|at| at.elapsed().as_millis() as u64),
+            "perTopic": per_topic,
+            "manual": manual.map(|manual| serde_json::json!({
+                "sent": manual.sent.load(Ordering::Relaxed),
+                "rejected": manual.rejected.load(Ordering::Relaxed),
+            })),
+        });
+        // Diagnostics must never take the link down; a failed put is dropped.
+        let _ = self.publisher.put(diag.to_string()).wait();
+    }
+}
+
 /// Per-topic arrival counts plus the routing rejections, which the periodic
 /// summary reports next to the decoder's own counters.
 #[derive(Default)]
@@ -601,6 +690,7 @@ fn run_loop<L: Link + ?Sized>(
     sink: &mut dyn FrameSink,
     mut uplink: Option<&mut Uplink>,
     manual: Option<&ManualUplink>,
+    mut diag: Option<DiagPublisher<'_>>,
 ) -> Result<()> {
     let mut decoder = FrameDecoder::new();
     let mut stats = Stats::default();
@@ -624,6 +714,10 @@ fn run_loop<L: Link + ?Sized>(
             if let Some(frame) = uplink.tick() {
                 port.write_all(&frame)?;
             }
+        }
+
+        if let Some(diag) = diag.as_mut() {
+            diag.tick(&decoder.counters(), &stats, manual);
         }
 
         if cli.status_interval_secs > 0 && Instant::now() >= next_status {

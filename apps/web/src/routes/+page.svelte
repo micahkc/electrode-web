@@ -79,7 +79,27 @@
     | { type: 'topicCatalog'; catalog: TopicCatalog }
     | { type: 'runtimeCommandStatus'; status: 'sent' | 'error'; message: string }
     | { type: 'runtimeParameterValue'; name: string; value: number }
+    | { type: 'telemetryLinkDiag'; diag: TelemetryLinkDiag }
     | { type: 'replay'; replay: ReplayState };
+
+  /** 1 Hz link diagnostics published by the telemetry bridge. */
+  interface TelemetryLinkDiag {
+    transport?: 'serial' | 'udp';
+    target?: string;
+    upSeconds?: number;
+    frames?: number;
+    frameRateHz?: number;
+    crcErrors?: number;
+    badLength?: number;
+    resyncs?: number;
+    seqGaps?: number;
+    dropped?: number;
+    unknownTopic?: number;
+    sizeErrors?: number;
+    lastFrameAgeMs?: number | null;
+    perTopic?: Record<string, number>;
+    manual?: { sent?: number; rejected?: number } | null;
+  }
 
   type MapViewMode = '2d' | '3d';
   type VehicleKind = 'quadrotor' | 'fixedwing';
@@ -626,6 +646,16 @@
   let telemetryLinkMode: 'serial' | 'udp' = 'serial';
   let telemetryUdpAddress = '';
   let telemetryManualUplink = false;
+  let telemetryLinkDiag: TelemetryLinkDiag | null = null;
+  let telemetryLinkDiagAt = 0;
+  let diagClockMs = Date.now();
+
+  /** The diag stream itself is 1 Hz; silence means the bridge is down. */
+  $: telemetryDiagFresh = telemetryLinkDiag !== null && diagClockMs - telemetryLinkDiagAt < 3000;
+  $: telemetryFramesFlowing =
+    telemetryDiagFresh &&
+    telemetryLinkDiag?.lastFrameAgeMs != null &&
+    telemetryLinkDiag.lastFrameAgeMs < 3000;
 
   function telemetryLinkLabel(profile: TelemetryProfile): string {
     return profile.linkMode === 'udp'
@@ -835,6 +865,7 @@
     });
     const autopilotTimer = setInterval(() => void refreshAutopilotRun(), 2000);
     const manualBridgeTimer = setInterval(() => void refreshManualBridge(), 2000);
+    const diagClockTimer = setInterval(() => (diagClockMs = Date.now()), 1000);
     const keydown = (event: KeyboardEvent) => handleKeyboardRemote(event, true);
     const keyup = (event: KeyboardEvent) => handleKeyboardRemote(event, false);
     window.addEventListener('keydown', keydown);
@@ -860,6 +891,9 @@
       } else if (message.type === 'runtimeParameterValue') {
         runtimeParameterValues = { ...runtimeParameterValues, [message.name]: message.value };
         runtimeCommandStatus = `refreshed ${Object.keys(runtimeParameterValues).length} parameters`;
+      } else if (message.type === 'telemetryLinkDiag') {
+        telemetryLinkDiag = message.diag;
+        telemetryLinkDiagAt = Date.now();
       } else if (message.type === 'replay') {
         replay = message.replay;
       }
@@ -871,6 +905,7 @@
     return () => {
       clearInterval(autopilotTimer);
       clearInterval(manualBridgeTimer);
+      clearInterval(diagClockTimer);
       window.removeEventListener('keydown', keydown);
       window.removeEventListener('keyup', keyup);
       worker?.postMessage({ type: 'virtualManual', enabled: false });
@@ -1605,6 +1640,57 @@ vehicle built -S mocap-gnss; the default build drops injected fixes."
             <strong>ground station only</strong>
           </div>
         {/if}
+
+        <div class="io-group">
+          <h3>Link diagnostics</h3>
+          {#if telemetryLinkDiag && telemetryDiagFresh}
+            <div class="io-row">
+              <span>Link</span>
+              <strong>{telemetryFramesFlowing ? 'frames flowing' : 'up, no frames'}
+                — {telemetryLinkDiag.transport} {telemetryLinkDiag.target}</strong>
+            </div>
+            <div class="io-row">
+              <span>Frames</span>
+              <strong>{telemetryLinkDiag.frames ?? 0}
+                ({telemetryLinkDiag.frameRateHz ?? 0}/s{telemetryLinkDiag.lastFrameAgeMs != null
+                  ? `, last ${telemetryLinkDiag.lastFrameAgeMs} ms ago`
+                  : ', none yet'})</strong>
+            </div>
+            <div class="io-row">
+              <span>CRC / resync</span>
+              <strong>{telemetryLinkDiag.crcErrors ?? 0} / {telemetryLinkDiag.resyncs ?? 0}</strong>
+            </div>
+            <div class="io-row">
+              <span>Drops (gaps)</span>
+              <strong>{telemetryLinkDiag.dropped ?? 0} ({telemetryLinkDiag.seqGaps ?? 0})</strong>
+            </div>
+            <div class="io-row">
+              <span>Rejected</span>
+              <strong>{(telemetryLinkDiag.badLength ?? 0) + (telemetryLinkDiag.sizeErrors ?? 0)} bad size,
+                {telemetryLinkDiag.unknownTopic ?? 0} unknown topic</strong>
+            </div>
+            {#if telemetryLinkDiag.manual}
+              <div class="io-row">
+                <span>WiFi RC</span>
+                <strong>{telemetryLinkDiag.manual.sent ?? 0} sent,
+                  {telemetryLinkDiag.manual.rejected ?? 0} rejected</strong>
+              </div>
+            {/if}
+            {#if telemetryLinkDiag.perTopic && Object.keys(telemetryLinkDiag.perTopic).length > 0}
+              <div class="io-row">
+                <span>Topics</span>
+                <strong>{Object.entries(telemetryLinkDiag.perTopic)
+                  .map(([key, count]) => `${key} ${count}`)
+                  .join(' · ')}</strong>
+              </div>
+            {/if}
+          {:else}
+            <div class="io-row">
+              <span>Link</span>
+              <strong>{telemetryRunning ? 'bridge silent (no diagnostics)' : 'bridge stopped'}</strong>
+            </div>
+          {/if}
+        </div>
 
         <div class="io-group">
           <h3>GNSS</h3>
