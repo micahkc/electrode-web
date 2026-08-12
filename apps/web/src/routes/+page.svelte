@@ -2034,7 +2034,10 @@ disconnects the link."
       />
     </section>
 
-    <section class="panel manual-panel" class:hidden={dashboardProfile === 'drone'}>
+    <!-- Shown on both airframes: the plane always flew RC from here, and the
+         micro-quad's WiFi RC sources the same manual topic (gamepad or
+         keyboard) up its telemetry link. -->
+    <section class="panel manual-panel">
       <div class="panel-heading">
         <div>
           <h2>Manual Link</h2>
