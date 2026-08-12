@@ -283,7 +283,7 @@
   let mapViewMode: MapViewMode = initialMapViewMode();
   let selectedVehicleType: VehicleKind =
     initialDashboardProfile() === 'drone' ? 'quadrotor' : 'fixedwing';
-  let zenohEndpoint = 'ws/127.0.0.1:7447';
+  let zenohEndpoint = initialZenohEndpoint();
   let vehicle = createInitialVehicleState(vehicleId);
   let replay: ReplayState = { loaded: false, playing: false, cursorMs: 0, durationMs: 0, speed: 1, frameCount: 0 };
   let recording = false;
@@ -938,6 +938,21 @@
   function connect(): void {
     const url = zenohEndpoint;
     worker?.postMessage({ type: 'connect', mode: runtimeMode, url, vehicleId });
+  }
+
+  /**
+   * The browser's Zenoh WebSocket endpoint. Port allocation can shift the
+   * whole stack (e.g. onto 8791/7448 when the canonical ports were busy at
+   * startup), and a page hardcoded to 7447 then renders with no data.
+   * `?zenoh=ws/127.0.0.1:7448` overrides it without a rebuild.
+   */
+  function initialZenohEndpoint(): string {
+    const fallback = 'ws/127.0.0.1:7447';
+    if (typeof window === 'undefined') {
+      return fallback;
+    }
+    const requested = new URLSearchParams(window.location.search).get('zenoh');
+    return requested && requested.trim() ? requested.trim() : fallback;
   }
 
   function initialMapViewMode(): MapViewMode {
