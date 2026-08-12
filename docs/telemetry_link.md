@@ -157,7 +157,7 @@ links only — see below; inertial injection is not wired here.
 `--udp-address HOST:PORT` (or `TELEMETRY_UDP_ADDRESS`) replaces the serial
 port with a connected UDP socket, for vehicles whose "radio" is a transparent
 UART↔UDP WiFi bridge such as the micro-quad's ESP32 access point
-(`192.168.4.1:14550` by default). The framing is identical; the decoder does
+(`192.168.71.1:14550` by default). The framing is identical; the decoder does
 not care what carries the bytes.
 
 Because a UDP socket, unlike a serial port, can be shared across threads,

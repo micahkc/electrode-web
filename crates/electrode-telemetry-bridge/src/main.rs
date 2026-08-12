@@ -89,7 +89,7 @@ struct Cli {
         env = "TELEMETRY_UDP_ADDRESS",
         value_name = "ADDR",
         help = "Use UDP to the vehicle's WiFi bridge instead of a serial device, e.g. \
-                192.168.4.1:14550 (the micro-quad ESP32 access point). Carries the identical \
+                192.168.71.1:14550 (the micro-quad ESP32 access point). Carries the identical \
                 synapse serial framing"
     )]
     udp_address: Option<String>,
@@ -698,7 +698,14 @@ fn run_loop<L: Link + ?Sized>(
     let status_interval = Duration::from_secs(cli.status_interval_secs);
     let mut next_status = Instant::now() + status_interval;
 
+    let mut next_keepalive = Instant::now();
+
     loop {
+        if Instant::now() >= next_keepalive {
+            let _ = port.keepalive();
+            next_keepalive = Instant::now() + Duration::from_secs(1);
+        }
+
         match port.read(&mut buf) {
             Ok(0) => {}
             Ok(read) => consume(cli, &mut decoder, &mut stats, sink, &buf[..read])?,

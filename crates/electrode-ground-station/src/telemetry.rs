@@ -50,7 +50,7 @@ pub(crate) struct TelemetryProfile {
 /// The ESP32 bridge's access-point address and port.
 fn default_udp_address() -> String {
     std::env::var("ELECTRODE_TELEMETRY_UDP_ADDRESS")
-        .unwrap_or_else(|_| "192.168.4.1:14550".to_string())
+        .unwrap_or_else(|_| "192.168.71.1:14550".to_string())
 }
 
 impl Default for TelemetryProfile {
@@ -177,7 +177,7 @@ mod tests {
     fn udp_mode_swaps_the_transport_flags() {
         let profile = TelemetryProfile {
             link_mode: LinkMode::Udp,
-            udp_address: "192.168.4.1:14550".to_string(),
+            udp_address: "192.168.71.1:14550".to_string(),
             manual_uplink: true,
             ..TelemetryProfile::default()
         };
@@ -187,7 +187,7 @@ mod tests {
         let index = args.iter().position(|arg| arg == "--udp-address");
         assert_eq!(
             args.get(index.expect("flag") + 1),
-            Some(&"192.168.4.1:14550".to_string())
+            Some(&"192.168.71.1:14550".to_string())
         );
         assert!(args.contains(&"--manual-uplink".to_string()));
         assert!(!args.contains(&"--serial-device".to_string()));

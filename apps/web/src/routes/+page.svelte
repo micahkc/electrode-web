@@ -1565,7 +1565,7 @@ bridge, carrying the same framing, with optional RC uplink."
               type="text"
               bind:value={telemetryUdpAddress}
               oninput={() => (telemetryLinkDirty = true)}
-              placeholder="192.168.4.1:14550"
+              placeholder="192.168.71.1:14550"
               title="UDP address of the vehicle's WiFi bridge (the ESP32 access point)"
             />
             <label

@@ -15,6 +15,14 @@ use std::time::Duration;
 pub trait Link {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>;
+
+    /// Announce presence. The WiFi bridge learns its telemetry destination
+    /// from inbound datagrams, and a receive-only session (no manual uplink,
+    /// no mocap) would otherwise never send one and hear nothing back.
+    /// Serial links need no such thing.
+    fn keepalive(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<T: serialport::SerialPort + ?Sized> Link for T {
@@ -66,6 +74,12 @@ impl Link for UdpLink {
 
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         self.socket.send(buf).map(|_| ())
+    }
+
+    /// An empty datagram: the bridge learns the peer, the vehicle-side UART
+    /// write is zero bytes, and the framing never sees it.
+    fn keepalive(&mut self) -> std::io::Result<()> {
+        self.socket.send(&[]).map(|_| ())
     }
 }
 
