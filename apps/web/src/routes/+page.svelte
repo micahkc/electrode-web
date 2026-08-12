@@ -463,11 +463,14 @@
   $: ioHealth = topicByCatalogName(vehicle, 'VehicleHealth');
   $: ioAttitude = topicByCatalogName(vehicle, 'AttitudeEstimate');
   $: ioGnss = topicByCatalogName(vehicle, 'GnssFix');
-  // Autopilot, Radio and SIM configure the fixed-wing path; the rdd2 flies on
-  // its telemetry radio and has none of that hardware in the loop.
+  // Autopilot and SIM configure the fixed-wing path. Radio Config stays on
+  // both airframes: the micro-quad flies GCS-side RC (gamepad/keyboard over
+  // its WiFi telemetry link), so channel mapping matters there too.
   $: visibleGroundStationPages =
     dashboardProfile === 'drone'
-      ? groundStationPages.filter((page) => page.key === 'dashboard')
+      ? groundStationPages.filter(
+          (page) => page.key === 'dashboard' || page.key === 'radio-config'
+        )
       : groundStationPages;
   /** The six topics the RDD2 telemetry radio carries. */
   const TELEMETRY_TOPIC_NAMES = [
@@ -2036,8 +2039,13 @@ disconnects the link."
 
     <!-- Shown on both airframes: the plane always flew RC from here, and the
          micro-quad's WiFi RC sources the same manual topic (gamepad or
-         keyboard) up its telemetry link. -->
-    <section class="panel manual-panel">
+         keyboard) up its telemetry link. The grid auto-places panels in
+         document order, so on the drone layout this panel goes last (order)
+         rather than reshuffling the cells the drone dashboard already has. -->
+    <section
+      class="panel manual-panel"
+      style:order={dashboardProfile === 'drone' ? 99 : undefined}
+    >
       <div class="panel-heading">
         <div>
           <h2>Manual Link</h2>
